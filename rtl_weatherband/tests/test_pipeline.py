@@ -4,7 +4,12 @@ import threading
 import time
 import unittest
 
-from rtl_weatherband.config import AudioConfig, CsdrServerConfig, DspConfig
+from rtl_weatherband.config import (
+    AudioConfig,
+    CsdrServerConfig,
+    DspConfig,
+    IcecastConfig,
+)
 from rtl_weatherband.pipeline import SILENCE_FRAME, StreamPipeline
 
 
@@ -25,7 +30,15 @@ class PipelineTests(unittest.TestCase):
     def make_pipeline(self) -> StreamPipeline:
         return StreamPipeline(
             DspConfig(ffmpeg_path="ffmpeg"),
-            AudioConfig(format="mp3", sample_rate=16000, bitrate="32k"),
+            AudioConfig(format="mp3", sample_rate=16000),
+            IcecastConfig(
+                host="127.0.0.1",
+                port=8000,
+                mount="/nwr.mp3",
+                username="source",
+                password="hackme",
+                bitrate=32,
+            ),
             CsdrServerConfig(host="127.0.0.1", listen_port=4951),
             162_550_000,
         )
@@ -65,7 +78,15 @@ class PipelineTests(unittest.TestCase):
     def test_ogg_ffmpeg_command(self) -> None:
         pipeline = StreamPipeline(
             DspConfig(ffmpeg_path="ffmpeg"),
-            AudioConfig(format="ogg", sample_rate=22050, bitrate="40k"),
+            AudioConfig(format="ogg", sample_rate=22050),
+            IcecastConfig(
+                host="127.0.0.1",
+                port=8000,
+                mount="/nwr.ogg",
+                username="source",
+                password="hackme",
+                bitrate=40,
+            ),
             CsdrServerConfig(host="127.0.0.1", listen_port=4951),
             162_550_000,
         )

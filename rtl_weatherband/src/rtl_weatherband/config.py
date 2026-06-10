@@ -10,6 +10,17 @@ import json5
 NOAA_MIN_MHZ = 162.4
 NOAA_MAX_MHZ = 162.55
 IQ_SAMPLE_RATE = 16000
+VALID_OUTPUT_SAMPLE_RATES = (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000)
+MP3_BITRATE_LIMITS_BY_SAMPLE_RATE = {
+    8000: (8, 64),
+    11025: (8, 64),
+    16000: (8, 160),
+    22050: (8, 160),
+    24000: (8, 160),
+    32000: (32, 320),
+    44100: (32, 320),
+    48000: (32, 320),
+}
 
 
 class ConfigError(ValueError):
@@ -43,6 +54,7 @@ class IcecastConfig:
     mount: str
     username: str
     password: str
+    bitrate: int
     tls: bool = False
     name: str | None = None
     genre: str | None = None
@@ -54,7 +66,6 @@ class IcecastConfig:
 class AudioConfig:
     format: str
     sample_rate: int
-    bitrate: str
     deemphasis_tau: float = 530.0
 
     @property
@@ -111,6 +122,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
             mount=_mount(_str(icecast, "mount")),
             username=_str(icecast, "username"),
             password=_str(icecast, "password"),
+            bitrate=_int(icecast, "bitrate"),
             tls=bool(icecast.get("tls", False)),
             name=_optional_str(icecast, "name"),
             genre=_optional_str(icecast, "genre"),
@@ -120,7 +132,6 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
         audio=AudioConfig(
             format=_str(audio, "format").lower(),
             sample_rate=_int(audio, "sample_rate"),
-            bitrate=_str(audio, "bitrate"),
             deemphasis_tau=float(audio.get("deemphasis_tau", 530.0)),
         ),
         dsp=DspConfig(
@@ -143,10 +154,30 @@ def validate_config(config: AppConfig) -> None:
         raise ConfigError("icecast.port must be from 1 through 65535")
     if config.audio.format not in {"mp3", "ogg"}:
         raise ConfigError("audio.format must be either 'mp3' or 'ogg'")
-    if config.audio.sample_rate <= 0:
-        raise ConfigError("audio.sample_rate must be greater than 0")
+    output_errors = _output_config_errors(config)
+    if output_errors:
+        raise ConfigError("; ".join(output_errors))
     if not 0 <= config.audio.deemphasis_tau <= 530:
         raise ConfigError("audio.deemphasis_tau must be between 0 and 530")
+
+
+def _output_config_errors(config: AppConfig) -> list[str]:
+    errors: list[str] = []
+    sample_rate = config.audio.sample_rate
+    bitrate = config.icecast.bitrate
+    if sample_rate not in VALID_OUTPUT_SAMPLE_RATES:
+        rates = ", ".join(str(rate) for rate in VALID_OUTPUT_SAMPLE_RATES)
+        errors.append(f"invalid sample rate: audio.sample_rate must be one of {rates}")
+    if bitrate <= 0:
+        errors.append("invalid bitrate: icecast.bitrate must be greater than 0")
+    elif config.audio.format == "mp3" and sample_rate in MP3_BITRATE_LIMITS_BY_SAMPLE_RATE:
+        minimum, maximum = MP3_BITRATE_LIMITS_BY_SAMPLE_RATE[sample_rate]
+        if not minimum <= bitrate <= maximum:
+            errors.append(
+                "invalid bitrate: icecast.bitrate must be between "
+                f"{minimum} and {maximum} Kbps for MP3 at {sample_rate} Hz"
+            )
+    return errors
 
 
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:

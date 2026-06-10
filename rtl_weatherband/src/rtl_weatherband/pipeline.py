@@ -11,7 +11,13 @@ import time
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
-from .config import AudioConfig, CsdrServerConfig, DspConfig, IQ_SAMPLE_RATE
+from .config import (
+    AudioConfig,
+    CsdrServerConfig,
+    DspConfig,
+    IcecastConfig,
+    IQ_SAMPLE_RATE,
+)
 from .csdr_server import open_iq_stream
 from .deemphasis import DeemphasisFilter
 from .nfm import NfmDemodulator, float_to_s16
@@ -42,6 +48,7 @@ class ProcessExit:
 class StreamPipeline:
     dsp: DspConfig
     audio: AudioConfig
+    icecast: IcecastConfig
     csdr_server: CsdrServerConfig
     frequency_hz: int
     processes: list[tuple[str, subprocess.Popen[bytes]]] = field(default_factory=list)
@@ -220,7 +227,7 @@ class StreamPipeline:
             "-ac",
             "1",
             "-b:a",
-            self.audio.bitrate,
+            f"{self.icecast.bitrate}k",
         ]
         if self.audio.format == "mp3":
             command.extend(["-f", "mp3", "-codec:a", "libmp3lame", "pipe:1"])
@@ -229,4 +236,3 @@ class StreamPipeline:
         else:
             raise PipelineError(f"unsupported audio format: {self.audio.format}")
         return command
-

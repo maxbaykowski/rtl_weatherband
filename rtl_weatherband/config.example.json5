@@ -17,6 +17,8 @@
     mount: "/nwr.mp3",
     username: "source",
     password: "hackme",
+    // Encoder bitrate in Kbps.
+    bitrate: 32,
     name: "NOAA Weather Radio",
     genre: "Weather",
     description: "NOAA Weather Radio via rtl_weatherband",
@@ -26,8 +28,8 @@
   audio: {
     // "mp3" or "ogg"
     format: "mp3",
+    // Valid values: 8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000.
     sample_rate: 16000,
-    bitrate: "32k",
     // NFM deemphasis tau in microseconds. 0 disables deemphasis.
     deemphasis_tau: 530,
   },

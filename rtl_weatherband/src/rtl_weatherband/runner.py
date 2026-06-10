@@ -22,6 +22,7 @@ def run(config: AppConfig) -> None:
         pipeline = StreamPipeline(
             config.dsp,
             config.audio,
+            config.icecast,
             config.csdr_server,
             config.station.frequency_hz,
         )
