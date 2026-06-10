@@ -9,10 +9,10 @@ def valid_config() -> dict:
     return {
         "csdr_server": {
             "host": "127.0.0.1",
-            "listen_port": 4951,
+            "port": 4951,
         },
         "station": {
-            "frequency_mhz": 162.55,
+            "frequency": 162.55,
         },
         "icecast": {
             "host": "127.0.0.1",
@@ -20,11 +20,11 @@ def valid_config() -> dict:
             "mount": "nwr.mp3",
             "username": "source",
             "password": "hackme",
+            "format": "mp3",
+            "sample_rate": 16000,
             "bitrate": 32,
         },
         "audio": {
-            "format": "mp3",
-            "sample_rate": 16000,
         },
     }
 
@@ -35,19 +35,20 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.station.frequency_hz, 162_550_000)
         self.assertEqual(config.csdr_server.control_port, 4952)
         self.assertEqual(config.icecast.mount, "/nwr.mp3")
+        self.assertEqual(config.icecast.content_type, "audio/mpeg")
+        self.assertEqual(config.icecast.sample_rate, 16000)
         self.assertEqual(config.icecast.bitrate, 32)
-        self.assertEqual(config.audio.content_type, "audio/mpeg")
         self.assertEqual(config.audio.deemphasis_tau, 530.0)
 
     def test_rejects_out_of_range_frequency(self) -> None:
         raw = valid_config()
-        raw["station"]["frequency_mhz"] = 162.3
+        raw["station"]["frequency"] = 162.3
         with self.assertRaises(ConfigError):
             parse_config(raw)
 
     def test_rejects_unknown_format(self) -> None:
         raw = valid_config()
-        raw["audio"]["format"] = "aac"
+        raw["icecast"]["format"] = "aac"
         with self.assertRaises(ConfigError):
             parse_config(raw)
 
@@ -77,36 +78,36 @@ class ConfigTests(unittest.TestCase):
 
     def test_rejects_invalid_output_sample_rate(self) -> None:
         raw = valid_config()
-        raw["audio"]["sample_rate"] = 12345
+        raw["icecast"]["sample_rate"] = 12345
         with self.assertRaisesRegex(ConfigError, "invalid sample rate"):
             parse_config(raw)
 
     def test_rejects_mp3_bitrate_above_low_sample_rate_limit(self) -> None:
         raw = valid_config()
-        raw["audio"]["sample_rate"] = 8000
+        raw["icecast"]["sample_rate"] = 8000
         raw["icecast"]["bitrate"] = 65
         with self.assertRaisesRegex(ConfigError, "8 and 64 Kbps"):
             parse_config(raw)
 
     def test_rejects_mp3_bitrate_above_high_sample_rate_limit(self) -> None:
         raw = valid_config()
-        raw["audio"]["sample_rate"] = 44100
+        raw["icecast"]["sample_rate"] = 44100
         raw["icecast"]["bitrate"] = 321
         with self.assertRaisesRegex(ConfigError, "32 and 320 Kbps"):
             parse_config(raw)
 
     def test_accepts_ogg_with_shared_output_sample_rate(self) -> None:
         raw = valid_config()
-        raw["audio"]["format"] = "ogg"
-        raw["audio"]["sample_rate"] = 48000
+        raw["icecast"]["format"] = "ogg"
+        raw["icecast"]["sample_rate"] = 48000
         raw["icecast"]["bitrate"] = 500
         config = parse_config(raw)
-        self.assertEqual(config.audio.sample_rate, 48000)
+        self.assertEqual(config.icecast.sample_rate, 48000)
         self.assertEqual(config.icecast.bitrate, 500)
 
     def test_reports_sample_rate_and_bitrate_together(self) -> None:
         raw = valid_config()
-        raw["audio"]["sample_rate"] = 12345
+        raw["icecast"]["sample_rate"] = 12345
         raw["icecast"]["bitrate"] = 0
         with self.assertRaises(ConfigError) as context:
             parse_config(raw)

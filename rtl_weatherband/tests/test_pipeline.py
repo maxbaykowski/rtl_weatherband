@@ -7,7 +7,6 @@ import unittest
 from rtl_weatherband.config import (
     AudioConfig,
     CsdrServerConfig,
-    DspConfig,
     IcecastConfig,
 )
 from rtl_weatherband.pipeline import SILENCE_FRAME, StreamPipeline
@@ -29,17 +28,18 @@ class PcmSink:
 class PipelineTests(unittest.TestCase):
     def make_pipeline(self) -> StreamPipeline:
         return StreamPipeline(
-            DspConfig(ffmpeg_path="ffmpeg"),
-            AudioConfig(format="mp3", sample_rate=16000),
+            AudioConfig(),
             IcecastConfig(
                 host="127.0.0.1",
                 port=8000,
                 mount="/nwr.mp3",
                 username="source",
                 password="hackme",
+                format="mp3",
+                sample_rate=16000,
                 bitrate=32,
             ),
-            CsdrServerConfig(host="127.0.0.1", listen_port=4951),
+            CsdrServerConfig(host="127.0.0.1", port=4951),
             162_550_000,
         )
 
@@ -77,17 +77,18 @@ class PipelineTests(unittest.TestCase):
 
     def test_ogg_ffmpeg_command(self) -> None:
         pipeline = StreamPipeline(
-            DspConfig(ffmpeg_path="ffmpeg"),
-            AudioConfig(format="ogg", sample_rate=22050),
+            AudioConfig(),
             IcecastConfig(
                 host="127.0.0.1",
                 port=8000,
                 mount="/nwr.ogg",
                 username="source",
                 password="hackme",
+                format="ogg",
+                sample_rate=22050,
                 bitrate=40,
             ),
-            CsdrServerConfig(host="127.0.0.1", listen_port=4951),
+            CsdrServerConfig(host="127.0.0.1", port=4951),
             162_550_000,
         )
         self.assertIn("libvorbis", pipeline._ffmpeg_command())

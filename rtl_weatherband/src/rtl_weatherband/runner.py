@@ -16,11 +16,10 @@ def run(config: AppConfig) -> None:
     while True:
         icecast = IcecastSource(
             config.icecast,
-            config.audio.content_type,
-            timeout_seconds=config.csdr_server.timeout_seconds,
+            config.icecast.content_type,
+            timeout_seconds=config.csdr_server.timeout,
         )
         pipeline = StreamPipeline(
-            config.dsp,
             config.audio,
             config.icecast,
             config.csdr_server,

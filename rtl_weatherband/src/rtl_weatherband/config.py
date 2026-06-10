@@ -30,21 +30,21 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class CsdrServerConfig:
     host: str
-    listen_port: int
-    timeout_seconds: float = 10.0
+    port: int
+    timeout: float = 10.0
 
     @property
     def control_port(self) -> int:
-        return self.listen_port + 1
+        return self.port + 1
 
 
 @dataclass(frozen=True)
 class StationConfig:
-    frequency_mhz: float
+    frequency: float
 
     @property
     def frequency_hz(self) -> int:
-        return round(self.frequency_mhz * 1_000_000)
+        return round(self.frequency * 1_000_000)
 
 
 @dataclass(frozen=True)
@@ -54,6 +54,8 @@ class IcecastConfig:
     mount: str
     username: str
     password: str
+    format: str
+    sample_rate: int
     bitrate: int
     tls: bool = False
     name: str | None = None
@@ -61,25 +63,18 @@ class IcecastConfig:
     description: str | None = None
     public: bool = False
 
-
-@dataclass(frozen=True)
-class AudioConfig:
-    format: str
-    sample_rate: int
-    deemphasis_tau: float = 530.0
-
     @property
     def content_type(self) -> str:
         if self.format == "mp3":
             return "audio/mpeg"
         if self.format == "ogg":
             return "application/ogg"
-        raise ConfigError(f"unsupported audio format: {self.format}")
+        raise ConfigError(f"unsupported icecast format: {self.format}")
 
 
 @dataclass(frozen=True)
-class DspConfig:
-    ffmpeg_path: str = "ffmpeg"
+class AudioConfig:
+    deemphasis_tau: float = 530.0
 
 
 @dataclass(frozen=True)
@@ -88,7 +83,6 @@ class AppConfig:
     station: StationConfig
     icecast: IcecastConfig
     audio: AudioConfig
-    dsp: DspConfig
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -105,23 +99,22 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
     station = _section(raw, "station")
     icecast = _section(raw, "icecast")
     audio = _section(raw, "audio")
-    dsp = raw.get("dsp", {})
-    if not isinstance(dsp, dict):
-        raise ConfigError("dsp must be an object")
 
     app = AppConfig(
         csdr_server=CsdrServerConfig(
             host=_str(csdr_server, "host"),
-            listen_port=_int(csdr_server, "listen_port"),
-            timeout_seconds=float(csdr_server.get("timeout_seconds", 10.0)),
+            port=_int(csdr_server, "port"),
+            timeout=float(csdr_server.get("timeout", 10.0)),
         ),
-        station=StationConfig(frequency_mhz=float(station["frequency_mhz"])),
+        station=StationConfig(frequency=float(station["frequency"])),
         icecast=IcecastConfig(
             host=_str(icecast, "host"),
             port=_int(icecast, "port"),
             mount=_mount(_str(icecast, "mount")),
             username=_str(icecast, "username"),
             password=_str(icecast, "password"),
+            format=_str(icecast, "format").lower(),
+            sample_rate=_int(icecast, "sample_rate"),
             bitrate=_int(icecast, "bitrate"),
             tls=bool(icecast.get("tls", False)),
             name=_optional_str(icecast, "name"),
@@ -130,12 +123,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
             public=bool(icecast.get("public", False)),
         ),
         audio=AudioConfig(
-            format=_str(audio, "format").lower(),
-            sample_rate=_int(audio, "sample_rate"),
             deemphasis_tau=float(audio.get("deemphasis_tau", 530.0)),
-        ),
-        dsp=DspConfig(
-            ffmpeg_path=str(dsp.get("ffmpeg_path", "ffmpeg")),
         ),
     )
     validate_config(app)
@@ -143,17 +131,17 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
 
 
 def validate_config(config: AppConfig) -> None:
-    frequency = config.station.frequency_mhz
+    frequency = config.station.frequency
     if not NOAA_MIN_MHZ <= frequency <= NOAA_MAX_MHZ:
         raise ConfigError(
-            f"frequency_mhz must be between {NOAA_MIN_MHZ} and {NOAA_MAX_MHZ}"
+            f"station.frequency must be between {NOAA_MIN_MHZ} and {NOAA_MAX_MHZ}"
         )
-    if config.csdr_server.listen_port <= 0 or config.csdr_server.listen_port > 65534:
-        raise ConfigError("csdr_server.listen_port must be from 1 through 65534")
+    if config.csdr_server.port <= 0 or config.csdr_server.port > 65534:
+        raise ConfigError("csdr_server.port must be from 1 through 65534")
     if config.icecast.port <= 0 or config.icecast.port > 65535:
         raise ConfigError("icecast.port must be from 1 through 65535")
-    if config.audio.format not in {"mp3", "ogg"}:
-        raise ConfigError("audio.format must be either 'mp3' or 'ogg'")
+    if config.icecast.format not in {"mp3", "ogg"}:
+        raise ConfigError("icecast.format must be either 'mp3' or 'ogg'")
     output_errors = _output_config_errors(config)
     if output_errors:
         raise ConfigError("; ".join(output_errors))
@@ -163,14 +151,17 @@ def validate_config(config: AppConfig) -> None:
 
 def _output_config_errors(config: AppConfig) -> list[str]:
     errors: list[str] = []
-    sample_rate = config.audio.sample_rate
+    sample_rate = config.icecast.sample_rate
     bitrate = config.icecast.bitrate
     if sample_rate not in VALID_OUTPUT_SAMPLE_RATES:
         rates = ", ".join(str(rate) for rate in VALID_OUTPUT_SAMPLE_RATES)
-        errors.append(f"invalid sample rate: audio.sample_rate must be one of {rates}")
+        errors.append(f"invalid sample rate: icecast.sample_rate must be one of {rates}")
     if bitrate <= 0:
         errors.append("invalid bitrate: icecast.bitrate must be greater than 0")
-    elif config.audio.format == "mp3" and sample_rate in MP3_BITRATE_LIMITS_BY_SAMPLE_RATE:
+    elif (
+        config.icecast.format == "mp3"
+        and sample_rate in MP3_BITRATE_LIMITS_BY_SAMPLE_RATE
+    ):
         minimum, maximum = MP3_BITRATE_LIMITS_BY_SAMPLE_RATE[sample_rate]
         if not minimum <= bitrate <= maximum:
             errors.append(

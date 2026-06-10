@@ -12,15 +12,16 @@ Python dependencies are declared in `pyproject.toml`.
 
 External system dependencies:
 
-- `ffmpeg`
+- `ffmpeg` on `$PATH`
 - an Icecast server with source credentials
 
 ## Configuration
 
-Configuration is JSON5. Frequency is specified in MHz and must be between
-`162.4` and `162.55`. NFM deemphasis is enabled by default with
+Configuration is JSON5. `station.frequency` is specified in MHz and must be
+between `162.4` and `162.55`. NFM deemphasis is enabled by default with
 `audio.deemphasis_tau` set to `530` microseconds. Set it to `0` to disable it.
-Encoder bitrate is configured as `icecast.bitrate` in Kbps.
+Encoder format, sample rate, and bitrate are configured as `icecast.format`,
+`icecast.sample_rate`, and `icecast.bitrate` in Kbps.
 
 Valid output sample rates for MP3 and Ogg Vorbis are `8000`, `11025`, `16000`,
 `22050`, `24000`, `32000`, `44100`, and `48000` Hz. MP3 bitrate is capped by

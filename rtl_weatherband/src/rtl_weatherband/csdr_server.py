@@ -44,13 +44,13 @@ def _socket_is_connected(sock: socket.socket) -> bool:
 def open_iq_stream(config: CsdrServerConfig, frequency_hz: int) -> IqStream:
     token = uuid.uuid4().hex
     stream_sock = socket.create_connection(
-        (config.host, config.listen_port), timeout=config.timeout_seconds
+        (config.host, config.port), timeout=config.timeout
     )
     control_sock: socket.socket | None = None
     try:
         stream_sock.sendall(token.encode("utf-8") + b"\n")
         control_sock = socket.create_connection(
-            (config.host, config.control_port), timeout=config.timeout_seconds
+            (config.host, config.control_port), timeout=config.timeout
         )
         request = {
             "stream_token": token,

@@ -1,40 +1,49 @@
 {
   csdr_server: {
+    // The hostname or IP address of the csdr_server instance
     host: "127.0.0.1",
-    listen_port: 4951,
-    timeout_seconds: 10,
+    // The TCP port the server listens on
+    port: 4951,
+    // Timeout, in seconds, before attempting to reconnect after a failure
+    timeout: 10,
   },
 
   station: {
-    // MHz. Valid NOAA Weather Radio range: 162.4 through 162.55.
-    frequency_mhz: 162.55,
+    // Frequency in MHz. Valid NOAA Weather Radio range: 162.4 through 162.55.
+    frequency: 162.55,
   },
 
   icecast: {
+    // The hostname, IP address, or web URL of the icecast server
     host: "127.0.0.1",
+    // The port the server listens on
     port: 8000,
+    // Enable if the icecast server uses TLS
     tls: false,
+    // The mountpoint where the stream will be accessible to listeners
     mount: "/nwr.mp3",
+    // The username for authentication to the server
     username: "source",
+    // The password for authentication to the server
     password: "hackme",
+    // Streaming format ("mp3" or "ogg"
+    format: "mp3",
+    // The sample rate for the stream. Valid values are 8000, 11025, 16000, 22050, 24000, 32000, 44100, and 48000.
+    sample_rate: 16000,
     // Encoder bitrate in Kbps.
     bitrate: 32,
+    // The stream name that will appear on the icecast status page
     name: "NOAA Weather Radio",
+    // The genre of the stream. This doesn't really matter for NOAA Weather Radio Streaming.
     genre: "Weather",
+    // The stream description that will appear on the icecast status page
     description: "NOAA Weather Radio via rtl_weatherband",
-    public: false,
+    // Controls whether the stream is publically available for anyone that connects to the icecast server (you most likely want this enabled)
+    public: true,
   },
 
   audio: {
-    // "mp3" or "ogg"
-    format: "mp3",
-    // Valid values: 8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000.
-    sample_rate: 16000,
-    // NFM deemphasis tau in microseconds. 0 disables deemphasis.
+    // NFM deemphasis filter for getting rid of high frequency content (set to 0 to disable).
     deemphasis_tau: 530,
-  },
-
-  dsp: {
-    ffmpeg_path: "ffmpeg",
   },
 }

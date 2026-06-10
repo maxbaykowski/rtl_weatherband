@@ -14,7 +14,6 @@ from typing import BinaryIO
 from .config import (
     AudioConfig,
     CsdrServerConfig,
-    DspConfig,
     IcecastConfig,
     IQ_SAMPLE_RATE,
 )
@@ -46,7 +45,6 @@ class ProcessExit:
 
 @dataclass
 class StreamPipeline:
-    dsp: DspConfig
     audio: AudioConfig
     icecast: IcecastConfig
     csdr_server: CsdrServerConfig
@@ -54,7 +52,7 @@ class StreamPipeline:
     processes: list[tuple[str, subprocess.Popen[bytes]]] = field(default_factory=list)
     producer_thread: threading.Thread | None = None
     writer_thread: threading.Thread | None = None
-    dsp_error: BaseException | None = None
+    stream_error: BaseException | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     pcm_queue: queue.Queue[bytes] = field(
         default_factory=lambda: queue.Queue(maxsize=PCM_QUEUE_CHUNKS)
@@ -89,7 +87,7 @@ class StreamPipeline:
             if self.writer_thread is not None and not self.writer_thread.is_alive():
                 return ProcessExit(
                     stage="pcm writer",
-                    returncode=1 if self.dsp_error is not None else 0,
+                    returncode=1 if self.stream_error is not None else 0,
                 )
             for stage, process in self.processes:
                 returncode = process.poll()
@@ -175,7 +173,7 @@ class StreamPipeline:
                 else:
                     next_write_at = time.monotonic()
         except (BrokenPipeError, OSError) as exc:
-            self.dsp_error = exc
+            self.stream_error = exc
         finally:
             try:
                 pcm_sink.close()
@@ -209,7 +207,7 @@ class StreamPipeline:
 
     def _ffmpeg_command(self) -> list[str]:
         command = [
-            self.dsp.ffmpeg_path,
+            "ffmpeg",
             "-hide_banner",
             "-loglevel",
             "warning",
@@ -223,16 +221,16 @@ class StreamPipeline:
             "pipe:0",
             "-vn",
             "-ar",
-            str(self.audio.sample_rate),
+            str(self.icecast.sample_rate),
             "-ac",
             "1",
             "-b:a",
             f"{self.icecast.bitrate}k",
         ]
-        if self.audio.format == "mp3":
+        if self.icecast.format == "mp3":
             command.extend(["-f", "mp3", "-codec:a", "libmp3lame", "pipe:1"])
-        elif self.audio.format == "ogg":
+        elif self.icecast.format == "ogg":
             command.extend(["-f", "ogg", "-codec:a", "libvorbis", "pipe:1"])
         else:
-            raise PipelineError(f"unsupported audio format: {self.audio.format}")
+            raise PipelineError(f"unsupported icecast format: {self.icecast.format}")
         return command
