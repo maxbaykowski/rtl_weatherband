@@ -40,6 +40,9 @@ class DeemphasisFilter:
         pcm = np.clip(filtered * PCM_SCALE, -32768, 32767).astype("<i2")
         return pcm.tobytes()
 
+    def process_float(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
+        return self._filter(samples)
+
     def flush(self) -> bytes:
         self._pending_byte = b""
         return b""
@@ -68,4 +71,3 @@ def generate_deemphasis_curve(sample_rate: int, tau: float) -> NDArray[np.float3
     curve = np.exp(-times / tau_seconds).astype(np.float32)
     curve /= np.sum(curve)
     return curve
-

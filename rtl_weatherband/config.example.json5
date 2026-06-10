@@ -33,7 +33,6 @@
   },
 
   dsp: {
-    csdr_path: "csdr",
     ffmpeg_path: "ffmpeg",
   },
 }

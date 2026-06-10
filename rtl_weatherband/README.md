@@ -1,8 +1,8 @@
 # rtl_weatherband
 
 `rtl_weatherband` connects to `csdr_server` for NOAA Weather Radio IQ data,
-demodulates it through external CSDR subprocesses, encodes the resulting PCM
-with `ffmpeg`, and streams the encoded audio directly to an Icecast mount.
+demodulates NFM with NumPy, encodes the resulting PCM with `ffmpeg`, and streams
+the encoded audio directly to an Icecast mount.
 
 This is the first iteration. Run one process per station/stream.
 
@@ -12,7 +12,6 @@ Python dependencies are declared in `pyproject.toml`.
 
 External system dependencies:
 
-- `csdr` from <https://github.com/maxbaykowski/csdr>
 - `ffmpeg`
 - an Icecast server with source credentials
 
@@ -30,13 +29,6 @@ See [config.example.json5](config.example.json5).
 rtl_weatherband config.example.json5
 ```
 
-The program requests IQ from `csdr_server` at 16000 S/s with float samples,
-runs:
-
-```sh
-csdr fmdemod --input float
-csdr convert --informat float --outformat s16
-```
-
-then applies NumPy-generated NFM deemphasis before piping mono signed 16-bit PCM
-into `ffmpeg` for MP3 or Ogg Vorbis encoding.
+The program requests interleaved float IQ from `csdr_server` at 16000 S/s,
+performs NFM demodulation and deemphasis with NumPy, then pipes mono signed
+16-bit PCM into `ffmpeg` for MP3 or Ogg Vorbis encoding.

@@ -10,6 +10,7 @@ from typing import BinaryIO
 
 from .config import AudioConfig, DspConfig, IQ_SAMPLE_RATE
 from .deemphasis import DeemphasisFilter
+from .nfm import NfmDemodulator, float_to_s16
 
 
 class PipelineError(RuntimeError):
@@ -27,57 +28,34 @@ class StreamPipeline:
     dsp: DspConfig
     audio: AudioConfig
     processes: list[tuple[str, subprocess.Popen[bytes]]] = field(default_factory=list)
-    deemphasis_thread: threading.Thread | None = None
+    dsp_thread: threading.Thread | None = None
+    dsp_error: BaseException | None = None
 
     def start(self, iq_socket: socket.socket, encoded_output: BinaryIO) -> None:
-        fmdemod = subprocess.Popen(
-            [self.dsp.csdr_path, "fmdemod"],
-            stdin=iq_socket.fileno(),
-            stdout=subprocess.PIPE,
-            stderr=None,
-        )
-        convert = subprocess.Popen(
-            [self.dsp.csdr_path, "convert", "--informat", "float", "--outformat", "s16"],
-            stdin=fmdemod.stdout,
-            stdout=subprocess.PIPE,
-            stderr=None,
-        )
-        if fmdemod.stdout is not None:
-            fmdemod.stdout.close()
-
-        ffmpeg_stdin: int | BinaryIO | None
-        if self.audio.deemphasis_tau > 0:
-            ffmpeg_stdin = subprocess.PIPE
-        else:
-            ffmpeg_stdin = convert.stdout
-
         ffmpeg = subprocess.Popen(
             self._ffmpeg_command(),
-            stdin=ffmpeg_stdin,
+            stdin=subprocess.PIPE,
             stdout=encoded_output,
             stderr=None,
         )
-        if self.audio.deemphasis_tau > 0:
-            self.deemphasis_thread = threading.Thread(
-                target=self._run_deemphasis,
-                args=(convert.stdout, ffmpeg.stdin),
-                name="deemphasis",
-                daemon=True,
-            )
-            self.deemphasis_thread.start()
-        elif convert.stdout is not None:
-            convert.stdout.close()
-
-        self.processes = [
-            ("fmdemod", fmdemod),
-            ("convert float to s16", convert),
-            ("ffmpeg encoder", ffmpeg),
-        ]
+        self.processes = [("ffmpeg encoder", ffmpeg)]
+        self.dsp_thread = threading.Thread(
+            target=self._run_numpy_dsp,
+            args=(iq_socket, ffmpeg.stdin),
+            name="numpy-nfm-demodulator",
+            daemon=True,
+        )
+        self.dsp_thread.start()
 
     def wait(self) -> ProcessExit:
         if not self.processes:
             raise PipelineError("pipeline was not started")
         while True:
+            if self.dsp_thread is not None and not self.dsp_thread.is_alive():
+                return ProcessExit(
+                    stage="numpy nfm demodulator",
+                    returncode=1 if self.dsp_error is not None else 0,
+                )
             for stage, process in self.processes:
                 returncode = process.poll()
                 if returncode is not None:
@@ -94,32 +72,31 @@ class StreamPipeline:
             except subprocess.TimeoutExpired:
                 process.kill()
 
-    def _run_deemphasis(
+    def _run_numpy_dsp(
         self,
-        pcm_source: BinaryIO | None,
+        iq_socket: socket.socket,
         pcm_sink: BinaryIO | None,
     ) -> None:
-        if pcm_source is None or pcm_sink is None:
+        if pcm_sink is None:
             return
+        demodulator = NfmDemodulator()
         deemphasis = DeemphasisFilter(IQ_SAMPLE_RATE, self.audio.deemphasis_tau)
         try:
             while True:
-                chunk = pcm_source.read(65536)
+                chunk = iq_socket.recv(65536)
                 if not chunk:
                     break
-                filtered = deemphasis.process(chunk)
-                if filtered:
-                    pcm_sink.write(filtered)
-            tail = deemphasis.flush()
-            if tail:
-                pcm_sink.write(tail)
-        except (BrokenPipeError, OSError):
-            pass
+                audio = demodulator.process(chunk)
+                if len(audio) == 0:
+                    continue
+                audio = deemphasis.process_float(audio)
+                pcm_sink.write(float_to_s16(audio))
+        except (BrokenPipeError, OSError) as exc:
+            self.dsp_error = exc
+        except BaseException as exc:
+            self.dsp_error = exc
+            raise
         finally:
-            try:
-                pcm_source.close()
-            except OSError:
-                pass
             try:
                 pcm_sink.close()
             except OSError:

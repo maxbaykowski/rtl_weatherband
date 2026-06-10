@@ -68,7 +68,6 @@ class AudioConfig:
 
 @dataclass(frozen=True)
 class DspConfig:
-    csdr_path: str = "csdr"
     ffmpeg_path: str = "ffmpeg"
 
 
@@ -125,7 +124,6 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
             deemphasis_tau=float(audio.get("deemphasis_tau", 530.0)),
         ),
         dsp=DspConfig(
-            csdr_path=str(dsp.get("csdr_path", "csdr")),
             ffmpeg_path=str(dsp.get("ffmpeg_path", "ffmpeg")),
         ),
     )

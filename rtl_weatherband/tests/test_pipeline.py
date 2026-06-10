@@ -9,7 +9,7 @@ from rtl_weatherband.pipeline import StreamPipeline
 class PipelineTests(unittest.TestCase):
     def test_mp3_ffmpeg_command(self) -> None:
         pipeline = StreamPipeline(
-            DspConfig(csdr_path="csdr", ffmpeg_path="ffmpeg"),
+            DspConfig(ffmpeg_path="ffmpeg"),
             AudioConfig(format="mp3", sample_rate=16000, bitrate="32k"),
         )
         self.assertEqual(
@@ -44,7 +44,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_ogg_ffmpeg_command(self) -> None:
         pipeline = StreamPipeline(
-            DspConfig(csdr_path="csdr", ffmpeg_path="ffmpeg"),
+            DspConfig(ffmpeg_path="ffmpeg"),
             AudioConfig(format="ogg", sample_rate=22050, bitrate="40k"),
         )
         self.assertIn("libvorbis", pipeline._ffmpeg_command())
@@ -52,4 +52,3 @@ class PipelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
