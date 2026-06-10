@@ -1,0 +1,38 @@
+{
+  csdr_server: {
+    host: "127.0.0.1",
+    listen_port: 4951,
+    timeout_seconds: 10,
+  },
+
+  station: {
+    // MHz. Valid NOAA Weather Radio range: 162.4 through 162.55.
+    frequency_mhz: 162.55,
+  },
+
+  icecast: {
+    host: "127.0.0.1",
+    port: 8000,
+    tls: false,
+    mount: "/nwr.mp3",
+    username: "source",
+    password: "hackme",
+    name: "NOAA Weather Radio",
+    genre: "Weather",
+    description: "NOAA Weather Radio via rtl_weatherband",
+    public: false,
+  },
+
+  audio: {
+    // "mp3" or "ogg"
+    format: "mp3",
+    sample_rate: 16000,
+    bitrate: "32k",
+  },
+
+  dsp: {
+    csdr_path: "csdr",
+    ffmpeg_path: "ffmpeg",
+  },
+}
+
