@@ -3,6 +3,7 @@ from __future__ import annotations
 import signal
 import socket
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
@@ -13,11 +14,17 @@ class PipelineError(RuntimeError):
     """Raised when the DSP or encoder pipeline fails."""
 
 
+@dataclass(frozen=True)
+class ProcessExit:
+    stage: str
+    returncode: int
+
+
 @dataclass
 class StreamPipeline:
     dsp: DspConfig
     audio: AudioConfig
-    processes: list[subprocess.Popen[bytes]] = field(default_factory=list)
+    processes: list[tuple[str, subprocess.Popen[bytes]]] = field(default_factory=list)
 
     def start(self, iq_socket: socket.socket, encoded_output: BinaryIO) -> None:
         fmdemod = subprocess.Popen(
@@ -43,23 +50,27 @@ class StreamPipeline:
         if convert.stdout is not None:
             convert.stdout.close()
 
-        self.processes = [fmdemod, convert, ffmpeg]
+        self.processes = [
+            ("fmdemod", fmdemod),
+            ("convert float to s16", convert),
+            ("ffmpeg encoder", ffmpeg),
+        ]
 
-    def wait(self) -> None:
+    def wait(self) -> ProcessExit:
         if not self.processes:
             raise PipelineError("pipeline was not started")
-        encoder = self.processes[-1]
-        return_code = encoder.wait()
-        if return_code != 0:
-            raise PipelineError(f"ffmpeg exited with status {return_code}")
-        for process in self.processes[:-1]:
-            process.wait(timeout=2)
+        while True:
+            for stage, process in self.processes:
+                returncode = process.poll()
+                if returncode is not None:
+                    return ProcessExit(stage=stage, returncode=returncode)
+            time.sleep(0.25)
 
     def stop(self) -> None:
-        for process in reversed(self.processes):
+        for _, process in reversed(self.processes):
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
-        for process in reversed(self.processes):
+        for _, process in reversed(self.processes):
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:

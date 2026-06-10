@@ -18,12 +18,27 @@ class IqStream:
     control_socket: socket.socket
     handshake: dict[str, object]
 
+    def is_connected(self) -> bool:
+        return _socket_is_connected(self.control_socket) and _socket_is_connected(
+            self.stream_socket
+        )
+
     def close(self) -> None:
         for sock in (self.stream_socket, self.control_socket):
             try:
                 sock.close()
             except OSError:
                 pass
+
+
+def _socket_is_connected(sock: socket.socket) -> bool:
+    try:
+        data = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    return data != b""
 
 
 def open_iq_stream(config: CsdrServerConfig, frequency_hz: int) -> IqStream:
@@ -76,4 +91,3 @@ def _read_json_line(sock: socket.socket) -> dict[str, object]:
     if not isinstance(message, dict):
         raise CsdrServerError("csdr_server handshake must be a JSON object")
     return message
-

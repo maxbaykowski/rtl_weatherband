@@ -21,12 +21,12 @@ External system dependencies:
 Configuration is JSON5. Frequency is specified in MHz and must be between
 `162.4` and `162.55`.
 
-See [examples/config.json5](examples/config.json5).
+See [config.example.json5](config.example.json5).
 
 ## Run
 
 ```sh
-rtl_weatherband examples/config.json5
+rtl_weatherband config.example.json5
 ```
 
 The program requests IQ from `csdr_server` at 16000 S/s with float samples,
@@ -38,4 +38,3 @@ csdr convert --input float --output s16
 ```
 
 and pipes mono signed 16-bit PCM into `ffmpeg` for MP3 or Ogg Vorbis encoding.
-
