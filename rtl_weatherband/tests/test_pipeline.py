@@ -1,17 +1,37 @@
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 
-from rtl_weatherband.config import AudioConfig, DspConfig
-from rtl_weatherband.pipeline import StreamPipeline
+from rtl_weatherband.config import AudioConfig, CsdrServerConfig, DspConfig
+from rtl_weatherband.pipeline import SILENCE_FRAME, StreamPipeline
+
+
+class PcmSink:
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, chunk: bytes) -> int:
+        self.data.extend(chunk)
+        return len(chunk)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class PipelineTests(unittest.TestCase):
-    def test_mp3_ffmpeg_command(self) -> None:
-        pipeline = StreamPipeline(
+    def make_pipeline(self) -> StreamPipeline:
+        return StreamPipeline(
             DspConfig(ffmpeg_path="ffmpeg"),
             AudioConfig(format="mp3", sample_rate=16000, bitrate="32k"),
+            CsdrServerConfig(host="127.0.0.1", listen_port=4951),
+            162_550_000,
         )
+
+    def test_mp3_ffmpeg_command(self) -> None:
+        pipeline = self.make_pipeline()
         self.assertEqual(
             pipeline._ffmpeg_command(),
             [
@@ -46,8 +66,29 @@ class PipelineTests(unittest.TestCase):
         pipeline = StreamPipeline(
             DspConfig(ffmpeg_path="ffmpeg"),
             AudioConfig(format="ogg", sample_rate=22050, bitrate="40k"),
+            CsdrServerConfig(host="127.0.0.1", listen_port=4951),
+            162_550_000,
         )
         self.assertIn("libvorbis", pipeline._ffmpeg_command())
+
+    def test_pcm_writer_outputs_silence_when_no_audio_is_available(self) -> None:
+        sink = PcmSink()
+        pipeline = self.make_pipeline()
+        try:
+            thread = threading.Thread(
+                target=pipeline._run_pcm_writer,
+                args=(sink,),
+            )
+            thread.start()
+            time.sleep(0.03)
+            pipeline.stop_event.set()
+            thread.join(timeout=1)
+        finally:
+            pipeline.stop_event.set()
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(bytes(sink.data[: len(SILENCE_FRAME)]), SILENCE_FRAME)
+        self.assertTrue(sink.closed)
 
 
 if __name__ == "__main__":

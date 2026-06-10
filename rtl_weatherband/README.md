@@ -31,4 +31,7 @@ rtl_weatherband config.example.json5
 
 The program requests interleaved float IQ from `csdr_server` at 16000 S/s,
 performs NFM demodulation and deemphasis with NumPy, then pipes mono signed
-16-bit PCM into `ffmpeg` for MP3 or Ogg Vorbis encoding.
+16-bit PCM into `ffmpeg` for MP3 or Ogg Vorbis encoding. If IQ audio is not
+available because the server is idle, disconnected, refusing connections, or
+buffer-underrunning, `rtl_weatherband` continuously feeds silence so Icecast
+clients do not see gaps in the source stream.
