@@ -1,44 +1,16 @@
 # rtl_weatherband
 
-`rtl_weatherband` connects to `csdr_server` for NOAA Weather Radio IQ data,
-demodulates NFM with NumPy, encodes the resulting PCM with `ffmpeg`, and streams
-the encoded audio directly to an Icecast mount.
+This utility can stream NOAA Weather Radio to icecast. At the present moment it doesn't do much else.
 
-This is the first iteration. Run one process per station/stream.
+## Install
+```bash
+pip install git+https://github.com/maxbaykowski/rtl_weatherband/@main
+```
 
-## Requirements
-
-Python dependencies are declared in `pyproject.toml`.
-
-External system dependencies:
-
-- `ffmpeg` on `$PATH`
-- an Icecast server with source credentials
+Also take a look at [csdr_server](https://github.com/maxbaykowski/csdr_server). You'll need to have it up and running as this program makes use of it.
 
 ## Configuration
 
-Configuration is JSON5. `station.frequency` is specified in MHz and must be
-between `162.4` and `162.55`. NFM deemphasis is enabled by default with
-`audio.deemphasis_tau` set to `530` microseconds. Set it to `0` to disable it.
-Encoder format, sample rate, and bitrate are configured as `icecast.format`,
-`icecast.sample_rate`, and `icecast.bitrate` in Kbps.
+Have a look at the example config in this repository, the configuration options have comments explaining what each option does.
 
-Valid output sample rates for MP3 and Ogg Vorbis are `8000`, `11025`, `16000`,
-`22050`, `24000`, `32000`, `44100`, and `48000` Hz. MP3 bitrate is capped by
-sample rate: `8`-`64` Kbps at `8000`/`11025` Hz, `8`-`160` Kbps at
-`16000`/`22050`/`24000` Hz, and `32`-`320` Kbps at `32000`/`44100`/`48000` Hz.
-
-See [config.example.json5](config.example.json5).
-
-## Run
-
-```sh
-rtl_weatherband config.example.json5
-```
-
-The program requests interleaved float IQ from `csdr_server` at 16000 S/s,
-performs NFM demodulation and deemphasis with NumPy, then pipes mono signed
-16-bit PCM into `ffmpeg` for MP3 or Ogg Vorbis encoding. If IQ audio is not
-available because the server is idle, disconnected, refusing connections, or
-buffer-underrunning, `rtl_weatherband` continuously feeds silence so Icecast
-clients do not see gaps in the source stream.
+Have fun, and happy streaming.

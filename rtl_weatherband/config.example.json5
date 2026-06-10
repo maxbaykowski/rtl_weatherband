@@ -24,7 +24,7 @@
     mount: "/nwr.mp3",
     // The username for authentication to the server
     username: "source",
-    // The password for authentication to the server
+    The password for authentication to the server
     password: "hackme",
     // Streaming format ("mp3" or "ogg"
     format: "mp3",
