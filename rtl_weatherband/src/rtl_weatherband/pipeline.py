@@ -3,11 +3,13 @@ from __future__ import annotations
 import signal
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
 from .config import AudioConfig, DspConfig, IQ_SAMPLE_RATE
+from .deemphasis import DeemphasisFilter
 
 
 class PipelineError(RuntimeError):
@@ -25,6 +27,7 @@ class StreamPipeline:
     dsp: DspConfig
     audio: AudioConfig
     processes: list[tuple[str, subprocess.Popen[bytes]]] = field(default_factory=list)
+    deemphasis_thread: threading.Thread | None = None
 
     def start(self, iq_socket: socket.socket, encoded_output: BinaryIO) -> None:
         fmdemod = subprocess.Popen(
@@ -41,13 +44,28 @@ class StreamPipeline:
         )
         if fmdemod.stdout is not None:
             fmdemod.stdout.close()
+
+        ffmpeg_stdin: int | BinaryIO | None
+        if self.audio.deemphasis_tau > 0:
+            ffmpeg_stdin = subprocess.PIPE
+        else:
+            ffmpeg_stdin = convert.stdout
+
         ffmpeg = subprocess.Popen(
             self._ffmpeg_command(),
-            stdin=convert.stdout,
+            stdin=ffmpeg_stdin,
             stdout=encoded_output,
             stderr=None,
         )
-        if convert.stdout is not None:
+        if self.audio.deemphasis_tau > 0:
+            self.deemphasis_thread = threading.Thread(
+                target=self._run_deemphasis,
+                args=(convert.stdout, ffmpeg.stdin),
+                name="deemphasis",
+                daemon=True,
+            )
+            self.deemphasis_thread.start()
+        elif convert.stdout is not None:
             convert.stdout.close()
 
         self.processes = [
@@ -75,6 +93,37 @@ class StreamPipeline:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 process.kill()
+
+    def _run_deemphasis(
+        self,
+        pcm_source: BinaryIO | None,
+        pcm_sink: BinaryIO | None,
+    ) -> None:
+        if pcm_source is None or pcm_sink is None:
+            return
+        deemphasis = DeemphasisFilter(IQ_SAMPLE_RATE, self.audio.deemphasis_tau)
+        try:
+            while True:
+                chunk = pcm_source.read(65536)
+                if not chunk:
+                    break
+                filtered = deemphasis.process(chunk)
+                if filtered:
+                    pcm_sink.write(filtered)
+            tail = deemphasis.flush()
+            if tail:
+                pcm_sink.write(tail)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                pcm_source.close()
+            except OSError:
+                pass
+            try:
+                pcm_sink.close()
+            except OSError:
+                pass
 
     def _ffmpeg_command(self) -> list[str]:
         command = [

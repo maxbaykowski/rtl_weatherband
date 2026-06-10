@@ -19,7 +19,8 @@ External system dependencies:
 ## Configuration
 
 Configuration is JSON5. Frequency is specified in MHz and must be between
-`162.4` and `162.55`.
+`162.4` and `162.55`. NFM deemphasis is enabled by default with
+`audio.deemphasis_tau` set to `530` microseconds. Set it to `0` to disable it.
 
 See [config.example.json5](config.example.json5).
 
@@ -34,7 +35,8 @@ runs:
 
 ```sh
 csdr fmdemod --input float
-csdr convert --input float --output s16
+csdr convert --informat float --outformat s16
 ```
 
-and pipes mono signed 16-bit PCM into `ffmpeg` for MP3 or Ogg Vorbis encoding.
+then applies NumPy-generated NFM deemphasis before piping mono signed 16-bit PCM
+into `ffmpeg` for MP3 or Ogg Vorbis encoding.

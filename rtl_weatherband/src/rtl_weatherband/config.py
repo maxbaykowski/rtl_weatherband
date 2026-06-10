@@ -55,6 +55,7 @@ class AudioConfig:
     format: str
     sample_rate: int
     bitrate: str
+    deemphasis_tau: float = 530.0
 
     @property
     def content_type(self) -> str:
@@ -121,6 +122,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
             format=_str(audio, "format").lower(),
             sample_rate=_int(audio, "sample_rate"),
             bitrate=_str(audio, "bitrate"),
+            deemphasis_tau=float(audio.get("deemphasis_tau", 530.0)),
         ),
         dsp=DspConfig(
             csdr_path=str(dsp.get("csdr_path", "csdr")),
@@ -145,6 +147,8 @@ def validate_config(config: AppConfig) -> None:
         raise ConfigError("audio.format must be either 'mp3' or 'ogg'")
     if config.audio.sample_rate <= 0:
         raise ConfigError("audio.sample_rate must be greater than 0")
+    if not 0 <= config.audio.deemphasis_tau <= 530:
+        raise ConfigError("audio.deemphasis_tau must be between 0 and 530")
 
 
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
@@ -179,4 +183,3 @@ def _int(raw: dict[str, Any], key: str) -> int:
 
 def _mount(value: str) -> str:
     return value if value.startswith("/") else f"/{value}"
-

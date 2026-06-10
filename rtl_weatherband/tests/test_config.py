@@ -36,6 +36,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.csdr_server.control_port, 4952)
         self.assertEqual(config.icecast.mount, "/nwr.mp3")
         self.assertEqual(config.audio.content_type, "audio/mpeg")
+        self.assertEqual(config.audio.deemphasis_tau, 530.0)
 
     def test_rejects_out_of_range_frequency(self) -> None:
         raw = valid_config()
@@ -49,7 +50,18 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             parse_config(raw)
 
+    def test_accepts_disabled_deemphasis(self) -> None:
+        raw = valid_config()
+        raw["audio"]["deemphasis_tau"] = 0
+        config = parse_config(raw)
+        self.assertEqual(config.audio.deemphasis_tau, 0)
+
+    def test_rejects_deemphasis_tau_above_maximum(self) -> None:
+        raw = valid_config()
+        raw["audio"]["deemphasis_tau"] = 531
+        with self.assertRaises(ConfigError):
+            parse_config(raw)
+
 
 if __name__ == "__main__":
     unittest.main()
-

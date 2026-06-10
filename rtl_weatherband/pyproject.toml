@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
   "csdr-server @ git+https://github.com/maxbaykowski/csdr_server.git@main",
   "json5>=0.9.0",
+  "numpy>=1.26",
 ]
 
 [project.scripts]
@@ -18,4 +19,3 @@ rtl_weatherband = "rtl_weatherband.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

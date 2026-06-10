@@ -28,6 +28,8 @@
     format: "mp3",
     sample_rate: 16000,
     bitrate: "32k",
+    // NFM deemphasis tau in microseconds. 0 disables deemphasis.
+    deemphasis_tau: 530,
   },
 
   dsp: {
@@ -35,4 +37,3 @@
     ffmpeg_path: "ffmpeg",
   },
 }
-
