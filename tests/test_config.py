@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from rtl_weatherband.config import ConfigError, parse_config
+from rtl_weatherband.config import ConfigError, merge_valid_reload_config, parse_config
 
 
 def valid_config() -> dict:
@@ -114,6 +114,18 @@ class ConfigTests(unittest.TestCase):
         message = str(context.exception)
         self.assertIn("invalid sample rate", message)
         self.assertIn("invalid bitrate", message)
+
+    def test_reload_keeps_only_invalid_sections(self) -> None:
+        current = parse_config(valid_config())
+        raw = valid_config()
+        raw["icecast"]["sample_rate"] = 12345
+        raw["audio"]["deemphasis_tau"] = 0
+
+        config, errors = merge_valid_reload_config(raw, current)
+
+        self.assertEqual(config.icecast, current.icecast)
+        self.assertEqual(config.audio.deemphasis_tau, 0)
+        self.assertTrue(any("icecast:" in error for error in errors))
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         config = load_config(args.config)
-        run(config)
+        run(config, args.config)
     except KeyboardInterrupt:
         return 130
     except ConfigError as exc:
@@ -42,4 +42,3 @@ def main(argv: list[str] | None = None) -> int:
         logging.getLogger(__name__).error("%s", exc)
         return 1
     return 0
-

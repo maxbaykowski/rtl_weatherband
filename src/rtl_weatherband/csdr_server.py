@@ -30,6 +30,23 @@ class IqStream:
             except OSError:
                 pass
 
+    def retune(self, frequency_hz: int) -> dict[str, object]:
+        request = {"command": "retune", "frequency": frequency_hz}
+        self.control_socket.sendall(
+            json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
+        )
+        while True:
+            response = _read_json_line(self.control_socket)
+            if response.get("event") is not None:
+                continue
+            if response.get("status") == "error":
+                raise CsdrServerError(str(response.get("error", response)))
+            if response.get("command") != "retune":
+                continue
+            if response.get("status") != "ok":
+                raise CsdrServerError(str(response.get("error", response)))
+            return response
+
 
 def _socket_is_connected(sock: socket.socket) -> bool:
     try:
