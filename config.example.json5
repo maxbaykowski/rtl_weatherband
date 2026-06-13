@@ -1,10 +1,10 @@
 {
   csdr_server: {
-    // The hostname or IP address of the csdr_server instance
+    // The hostname or IP address of the csdr_server instance.
     host: "127.0.0.1",
-    // The TCP port the server listens on
-    port: 4951,
-    // Timeout, in seconds, before attempting to reconnect after a failure
+    // The TCP port the server listens on.
+    port: 7355,
+    // Timeout, in seconds, before attempting to reconnect after connection drops.
     timeout: 10,
   },
 
@@ -14,36 +14,90 @@
   },
 
   icecast: {
-    // The hostname, IP address, or web URL of the icecast server
-    host: "127.0.0.1",
-    // The port the server listens on
-    port: 8000,
-    // Enable if the icecast server uses TLS
-    tls: false,
-    // The mountpoint where the stream will be accessible to listeners
-    mount: "/nwr.mp3",
-    // The username for authentication to the server
-    username: "source",
-    The password for authentication to the server
-    password: "hackme",
-    // Streaming format ("mp3" or "ogg"
-    format: "mp3",
-    // The sample rate for the stream. Valid values are 8000, 11025, 16000, 22050, 24000, 32000, 44100, and 48000.
-    sample_rate: 16000,
-    // Encoder bitrate in Kbps.
-    bitrate: 32,
-    // The stream name that will appear on the icecast status page
-    name: "NOAA Weather Radio",
-    // The genre of the stream. This doesn't really matter for NOAA Weather Radio Streaming.
-    genre: "Weather",
-    // The stream description that will appear on the icecast status page
-    description: "NOAA Weather Radio via rtl_weatherband",
-    // Controls whether the stream is publically available for anyone that connects to the icecast server (you most likely want this enabled)
-    public: true,
+    // Define one or more Icecast destinations.
+    // single-object icecast config is still supported.
+    destinations: [
+      {
+        // The hostname, IP address, or web URL of the icecast server.
+        host: "127.0.0.1",
+        // The port the server listens on.
+        port: 8000,
+        // Enable if the icecast server uses TLS.
+        tls: false,
+        // The mountpoint where the stream will be accessible to listeners.
+        mount: "/nwr.mp3",
+        // The username for authentication to the server.
+        username: "source",
+        // The password for authentication to the server.
+        password: "hackme",
+        // Streaming format ("mp3" or "ogg").
+        format: "mp3",
+        // The sample rate for the stream. Valid values are 8000, 11025, 16000, 22050, 24000, 32000, 44100, and 48000.
+        sample_rate: 16000,
+        // Encoder bitrate in Kbps.
+        bitrate: 32,
+        // The stream name that will appear on the icecast status page.
+        name: "NOAA Weather Radio",
+        // The genre of the stream. This doesn't really matter for NOAA Weather Radio Streaming.
+        genre: "Weather",
+        // The stream description that will appear on the icecast status page.
+        description: "NOAA Weather Radio via rtl_weatherband",
+        // Controls whether the stream is publically available for anyone that connects to the icecast server (you most likely want this enabled).
+        public: true,
+      },
+      // Add more destinations here if you want to stream to multiple mounts or servers.
+    ],
   },
 
   audio: {
-    // NFM deemphasis filter for getting rid of high frequency content (set to 0 to disable).
-    deemphasis_tau: 530,
+    // NFM deemphasis filter for reducing high frequency content.
+    deemphasis: {
+      enabled: true,
+      /*
+      Time constant in microseconds. Valid range: 0 through 530.
+      Please do not disable this filter, doing so will make NFM signals sound awful!
+      */
+      tau: 300,
+    },
+    // Controls the stream volume.
+    volume: {
+      enabled: false,
+      multiplier: 1.0,
+    },
+    /*
+    gets rid of low-frequency audio, such as 60 Hz hums.
+    To protect the 1050 Hz attention tone, frequency cannot be set above 900 Hz.
+    */
+    highpass: {
+      enabled: false,
+      frequency: 300,
+      /* Filter sharpness (0-10).
+      0 is more gentle, 10 will cut off frequencies much more aggressively.
+      */
+      sharpness: 2,
+    },
+    /*
+    gets rid of high-frequency audio. Use it in conjunction with the NFM deemphasis filter.
+    To protect SAME tones, frequency cannot be set below 2200 Hz.
+    */
+    lowpass: {
+      enabled: true,
+      frequency: 3000,
+      /* Filter sharpness (0-10).
+      0 is more gentle, 10 will cut off frequencies much more aggressively.
+      */
+      sharpness: 2,
+    },
+    /*
+    Removes a narrow tone, useful for analog whines.
+    To protect the 1050 Hz attention tone and the SAME tones, the frequency cannot be within protected bands 900-1100, 1400-1600, or 2000-2200 Hz.
+    notch: {
+      enabled: false,
+      frequency: 3000,
+      /* Filter sharpness (0-10).
+      0 is more gentle, 10 will cut off frequencies much more aggressively.
+      */
+      sharpness: 2,
+    },
   },
 }

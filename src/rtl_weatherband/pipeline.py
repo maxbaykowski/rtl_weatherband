@@ -18,7 +18,7 @@ from .config import (
     StationConfig,
 )
 from .csdr_server import CsdrServerError, IqStream, open_iq_stream
-from .deemphasis import DeemphasisFilter
+from .audio_effects import AudioEffectsProcessor
 from .encoder import AudioEncoder, create_audio_encoder
 from .nfm import NfmDemodulator, float_to_s16
 
@@ -45,14 +45,23 @@ class ProcessExit:
 
 
 @dataclass
+class OutputWorker:
+    config: IcecastConfig
+    encoder: AudioEncoder
+    pcm_queue: queue.Queue[bytes]
+    stop_event: threading.Event
+    thread: threading.Thread
+    error: BaseException | None = None
+
+
+@dataclass
 class StreamPipeline:
     audio: AudioConfig
-    icecast: IcecastConfig
+    icecast: tuple[IcecastConfig, ...]
     csdr_server: CsdrServerConfig
     frequency_hz: int
-    encoder: AudioEncoder | None = None
+    outputs: list[OutputWorker] = field(default_factory=list)
     producer_thread: threading.Thread | None = None
-    writer_thread: threading.Thread | None = None
     stream_error: BaseException | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     state_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -60,28 +69,28 @@ class StreamPipeline:
     pending_receiver: tuple[CsdrServerConfig, int] | None = None
     hotswap_thread: threading.Thread | None = None
     hotswap_result: tuple[tuple[CsdrServerConfig, int], IqStream, bytes] | None = None
-    pcm_queue: queue.Queue[bytes] = field(
-        default_factory=lambda: queue.Queue(maxsize=PCM_QUEUE_CHUNKS)
-    )
 
-    def start(self, encoded_output: BinaryIO) -> None:
-        self.encoder = create_audio_encoder(self.icecast)
+    def start(self, encoded_outputs: list[BinaryIO]) -> None:
+        if len(encoded_outputs) != len(self.icecast):
+            raise PipelineError("encoded output count must match Icecast destinations")
         self.producer_thread = threading.Thread(
             target=self._run_iq_producer,
             name="numpy-nfm-producer",
             daemon=True,
         )
-        self.writer_thread = threading.Thread(
-            target=self._run_encoded_writer,
-            args=(encoded_output,),
-            name="encoded-audio-writer",
-            daemon=True,
-        )
+        self.outputs = []
+        for destination, encoded_output in zip(
+            self.icecast, encoded_outputs, strict=True
+        ):
+            self.outputs.append(
+                self._create_output_worker(destination, encoded_output)
+            )
         self.producer_thread.start()
-        self.writer_thread.start()
+        for output in self.outputs:
+            output.thread.start()
 
     def wait(self) -> ProcessExit:
-        if self.writer_thread is None:
+        if not self.outputs:
             raise PipelineError("pipeline was not started")
         while True:
             process_exit = self.poll_exit()
@@ -90,11 +99,12 @@ class StreamPipeline:
             time.sleep(0.25)
 
     def poll_exit(self) -> ProcessExit | None:
-        if self.writer_thread is not None and not self.writer_thread.is_alive():
-            return ProcessExit(
-                stage="encoded audio writer",
-                returncode=1 if self.stream_error is not None else 0,
-            )
+        for index, output in enumerate(self.outputs):
+            if not output.thread.is_alive():
+                return ProcessExit(
+                    stage=f"encoded audio writer {index}",
+                    returncode=1 if output.error is not None else 0,
+                )
         return None
 
     def stop(self) -> None:
@@ -111,10 +121,57 @@ class StreamPipeline:
             iq_stream.close()
         if self.producer_thread is not None:
             self.producer_thread.join(timeout=2)
-        if self.writer_thread is not None:
-            self.writer_thread.join(timeout=2)
-        if self.encoder is not None:
-            self.encoder.close()
+        for output in list(self.outputs):
+            self._stop_output_worker(output)
+        self.outputs = []
+
+    def apply_icecast_outputs(
+        self,
+        icecast: tuple[IcecastConfig, ...],
+        remove_configs: list[IcecastConfig],
+        additions: list[tuple[IcecastConfig, BinaryIO]],
+    ) -> None:
+        for config in remove_configs:
+            self._remove_output(config)
+        for config, encoded_output in additions:
+            output = self._create_output_worker(config, encoded_output)
+            self.outputs.append(output)
+            output.thread.start()
+        self.icecast = icecast
+
+    def _create_output_worker(
+        self,
+        config: IcecastConfig,
+        encoded_output: BinaryIO,
+    ) -> OutputWorker:
+        encoder = create_audio_encoder(config)
+        pcm_queue: queue.Queue[bytes] = queue.Queue(maxsize=PCM_QUEUE_CHUNKS)
+        output = OutputWorker(
+            config=config,
+            encoder=encoder,
+            pcm_queue=pcm_queue,
+            stop_event=threading.Event(),
+            thread=threading.Thread(),
+        )
+        output.thread = threading.Thread(
+            target=self._run_encoded_writer,
+            args=(output, encoded_output),
+            name=f"encoded-audio-writer-{config.host}:{config.port}{config.mount}",
+            daemon=True,
+        )
+        return output
+
+    def _remove_output(self, config: IcecastConfig) -> None:
+        for output in list(self.outputs):
+            if output.config == config:
+                self.outputs.remove(output)
+                self._stop_output_worker(output)
+                return
+
+    def _stop_output_worker(self, output: OutputWorker) -> None:
+        output.stop_event.set()
+        output.thread.join(timeout=2)
+        output.encoder.close()
 
     def apply_runtime_config(self, config: AppConfig) -> AppConfig:
         applied = AppConfig(
@@ -207,41 +264,41 @@ class StreamPipeline:
         if iq_stream is None:
             raise ConnectionError("IQ stream is not active")
         demodulator = NfmDemodulator()
-        deemphasis_tau = self._deemphasis_tau()
-        deemphasis = DeemphasisFilter(IQ_SAMPLE_RATE, deemphasis_tau)
+        audio_config = self._audio_config()
+        effects = AudioEffectsProcessor(audio_config)
         while not self.stop_event.is_set():
             replacement = self._try_hotswap_iq_stream(iq_stream)
             if replacement is not None:
                 iq_stream, chunk = replacement
                 iq_socket = iq_stream.stream_socket
                 demodulator = NfmDemodulator()
-                deemphasis_tau = self._deemphasis_tau()
-                deemphasis = DeemphasisFilter(IQ_SAMPLE_RATE, deemphasis_tau)
-                self._process_iq_chunk(chunk, demodulator, deemphasis)
+                audio_config = self._audio_config()
+                effects = AudioEffectsProcessor(audio_config)
+                self._process_iq_chunk(chunk, demodulator, effects)
                 continue
-            next_tau = self._deemphasis_tau()
-            if next_tau != deemphasis_tau:
-                deemphasis_tau = next_tau
-                deemphasis = DeemphasisFilter(IQ_SAMPLE_RATE, deemphasis_tau)
-                LOG.info("updated deemphasis tau to %s", deemphasis_tau)
+            next_audio_config = self._audio_config()
+            if next_audio_config != audio_config:
+                audio_config = next_audio_config
+                effects = AudioEffectsProcessor(audio_config)
+                LOG.info("updated audio effects")
             readable, _, _ = select.select([iq_socket], [], [], 0.5)
             if not readable:
                 continue
             chunk = iq_socket.recv(65536)
             if not chunk:
                 raise ConnectionError("IQ stream socket closed")
-            self._process_iq_chunk(chunk, demodulator, deemphasis)
+            self._process_iq_chunk(chunk, demodulator, effects)
 
     def _process_iq_chunk(
         self,
         chunk: bytes,
         demodulator: NfmDemodulator,
-        deemphasis: DeemphasisFilter,
+        effects: AudioEffectsProcessor,
     ) -> None:
         audio = demodulator.process(chunk)
         if len(audio) == 0:
             return
-        audio = deemphasis.process_float(audio)
+        audio = effects.process(audio)
         self._queue_pcm(float_to_s16(audio))
 
     def _try_hotswap_iq_stream(
@@ -329,23 +386,27 @@ class StreamPipeline:
             raise ConnectionError("replacement IQ stream socket closed")
         return chunk
 
-    def _run_encoded_writer(self, encoded_sink: BinaryIO | None) -> None:
-        if encoded_sink is None or self.encoder is None:
+    def _run_encoded_writer(
+        self,
+        output: OutputWorker,
+        encoded_sink: BinaryIO | None,
+    ) -> None:
+        if encoded_sink is None:
             return
         pending = bytearray()
         next_write_at = time.monotonic()
         try:
-            header = getattr(self.encoder, "header", b"")
+            header = getattr(output.encoder, "header", b"")
             if header:
                 encoded_sink.write(header)
-            while not self.stop_event.is_set():
-                self._drain_pcm_queue(pending)
+            while not self.stop_event.is_set() and not output.stop_event.is_set():
+                self._drain_pcm_queue(output.pcm_queue, pending)
                 if len(pending) >= PCM_FRAME_BYTES:
                     frame = bytes(pending[:PCM_FRAME_BYTES])
                     del pending[:PCM_FRAME_BYTES]
                 else:
                     frame = SILENCE_FRAME
-                encoded = self.encoder.encode(frame)
+                encoded = output.encoder.encode(frame)
                 if encoded:
                     encoded_sink.write(encoded)
 
@@ -355,13 +416,13 @@ class StreamPipeline:
                     time.sleep(delay)
                 else:
                     next_write_at = time.monotonic()
-            encoded = self.encoder.flush()
+            encoded = output.encoder.flush()
             if encoded:
                 encoded_sink.write(encoded)
         except (BrokenPipeError, OSError) as exc:
-            self.stream_error = exc
+            output.error = exc
         except Exception as exc:
-            self.stream_error = exc
+            output.error = exc
         finally:
             try:
                 encoded_sink.close()
@@ -369,22 +430,30 @@ class StreamPipeline:
                 pass
 
     def _queue_pcm(self, pcm: bytes) -> None:
+        for output in list(self.outputs):
+            self._queue_pcm_for_output(output.pcm_queue, pcm)
+
+    def _queue_pcm_for_output(self, pcm_queue: queue.Queue[bytes], pcm: bytes) -> None:
         try:
-            self.pcm_queue.put_nowait(pcm)
+            pcm_queue.put_nowait(pcm)
         except queue.Full:
             try:
-                self.pcm_queue.get_nowait()
+                pcm_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self.pcm_queue.put_nowait(pcm)
+                pcm_queue.put_nowait(pcm)
             except queue.Full:
                 pass
 
-    def _drain_pcm_queue(self, pending: bytearray) -> None:
+    def _drain_pcm_queue(
+        self,
+        pcm_queue: queue.Queue[bytes],
+        pending: bytearray,
+    ) -> None:
         while True:
             try:
-                pending.extend(self.pcm_queue.get_nowait())
+                pending.extend(pcm_queue.get_nowait())
             except queue.Empty:
                 return
 
@@ -397,9 +466,9 @@ class StreamPipeline:
         with self.state_lock:
             return self.csdr_server, self.frequency_hz
 
-    def _deemphasis_tau(self) -> float:
+    def _audio_config(self) -> AudioConfig:
         with self.state_lock:
-            return self.audio.deemphasis_tau
+            return self.audio
 
     def _pending_receiver(self) -> tuple[CsdrServerConfig, int] | None:
         with self.state_lock:

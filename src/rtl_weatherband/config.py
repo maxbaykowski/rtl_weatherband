@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,15 @@ OGG_BITRATE_LIMITS_BY_SAMPLE_RATE = {
     44100: (32, 240),
     48000: (32, 240),
 }
+SAME_ATTENTION_BAND_HZ = (900.0, 1100.0)
+SAME_SPACE_BAND_HZ = (1400.0, 1600.0)
+SAME_MARK_BAND_HZ = (2000.0, 2200.0)
+PROTECTED_AUDIO_BANDS_HZ = (
+    ("1050 Hz attention tone", SAME_ATTENTION_BAND_HZ),
+    ("SAME space tone", SAME_SPACE_BAND_HZ),
+    ("SAME mark tone", SAME_MARK_BAND_HZ),
+)
+AUDIO_NYQUIST_HZ = IQ_SAMPLE_RATE / 2
 
 
 class ConfigError(ValueError):
@@ -83,15 +93,42 @@ class IcecastConfig:
 
 
 @dataclass(frozen=True)
+class DeemphasisConfig:
+    enabled: bool = True
+    tau: float = 530.0
+
+
+@dataclass(frozen=True)
+class VolumeConfig:
+    enabled: bool = False
+    multiplier: float = 1.0
+
+
+@dataclass(frozen=True)
+class FilterConfig:
+    enabled: bool = False
+    frequency: float = 0.0
+    sharpness: float = 0.0
+
+
+@dataclass(frozen=True)
 class AudioConfig:
-    deemphasis_tau: float = 530.0
+    deemphasis: DeemphasisConfig = field(default_factory=DeemphasisConfig)
+    volume: VolumeConfig = field(default_factory=VolumeConfig)
+    highpass: FilterConfig = field(default_factory=FilterConfig)
+    lowpass: FilterConfig = field(default_factory=FilterConfig)
+    notch: FilterConfig = field(default_factory=FilterConfig)
+
+    @property
+    def deemphasis_tau(self) -> float:
+        return self.deemphasis.tau if self.deemphasis.enabled else 0.0
 
 
 @dataclass(frozen=True)
 class AppConfig:
     csdr_server: CsdrServerConfig
     station: StationConfig
-    icecast: IcecastConfig
+    icecast: tuple[IcecastConfig, ...]
     audio: AudioConfig
 
 
@@ -113,13 +150,13 @@ def load_raw_config(path: str | Path) -> dict[str, Any]:
 def parse_config(raw: dict[str, Any]) -> AppConfig:
     csdr_server = _section(raw, "csdr_server")
     station = _section(raw, "station")
-    icecast = _section(raw, "icecast")
+    icecast = raw.get("icecast")
     audio = _section(raw, "audio")
 
     app = AppConfig(
         csdr_server=parse_csdr_server_config(csdr_server),
         station=parse_station_config(station),
-        icecast=parse_icecast_config(icecast),
+        icecast=parse_icecast_configs(icecast),
         audio=parse_audio_config(audio),
     )
     validate_config(app)
@@ -147,15 +184,15 @@ def merge_valid_reload_config(
         station = current.station
 
     try:
-        icecast = parse_icecast_config(_section(raw, "icecast"))
-        validate_icecast_config(icecast)
+        icecast = parse_icecast_configs(raw.get("icecast"))
+        validate_icecast_configs(icecast)
     except (ConfigError, KeyError, TypeError, ValueError) as exc:
         errors.append(f"icecast: {exc}")
         icecast = current.icecast
 
     try:
-        audio = parse_audio_config(_section(raw, "audio"))
-        validate_audio_config(audio)
+        audio, audio_errors = merge_valid_audio_config(_section(raw, "audio"), current.audio)
+        errors.extend(f"audio.{error}" for error in audio_errors)
     except (ConfigError, KeyError, TypeError, ValueError) as exc:
         errors.append(f"audio: {exc}")
         audio = current.audio
@@ -198,14 +235,151 @@ def parse_icecast_config(raw: dict[str, Any]) -> IcecastConfig:
     )
 
 
+def parse_icecast_configs(raw: Any) -> tuple[IcecastConfig, ...]:
+    if isinstance(raw, list):
+        configs = tuple(parse_icecast_config(_object(value, "icecast")) for value in raw)
+    elif isinstance(raw, dict) and "destinations" in raw:
+        destinations = raw["destinations"]
+        if not isinstance(destinations, list):
+            raise ConfigError("icecast.destinations must be an array")
+        configs = tuple(
+            parse_icecast_config(_object(value, "icecast destination"))
+            for value in destinations
+        )
+    elif isinstance(raw, dict):
+        configs = (parse_icecast_config(raw),)
+    else:
+        raise ConfigError("icecast must be an object or array")
+    if not configs:
+        raise ConfigError("icecast must define at least one destination")
+    return configs
+
+
 def parse_audio_config(raw: dict[str, Any]) -> AudioConfig:
-    return AudioConfig(deemphasis_tau=float(raw.get("deemphasis_tau", 530.0)))
+    if "deemphasis_tau" in raw and "deemphasis" not in raw:
+        tau = _float(raw, "deemphasis_tau")
+        audio = AudioConfig(
+            deemphasis=DeemphasisConfig(enabled=tau > 0, tau=tau),
+            volume=parse_volume_config(raw.get("volume")),
+            highpass=parse_filter_config(raw.get("highpass")),
+            lowpass=parse_filter_config(raw.get("lowpass")),
+            notch=parse_filter_config(raw.get("notch")),
+        )
+    else:
+        audio = AudioConfig(
+            deemphasis=parse_deemphasis_config(raw.get("deemphasis")),
+            volume=parse_volume_config(raw.get("volume")),
+            highpass=parse_filter_config(raw.get("highpass")),
+            lowpass=parse_filter_config(raw.get("lowpass")),
+            notch=parse_filter_config(raw.get("notch")),
+        )
+    validate_audio_config(audio)
+    return audio
+
+
+def merge_valid_audio_config(
+    raw: dict[str, Any],
+    current: AudioConfig,
+) -> tuple[AudioConfig, list[str]]:
+    errors: list[str] = []
+    changed_filters: set[str] = set()
+
+    try:
+        if "deemphasis_tau" in raw and "deemphasis" not in raw:
+            tau = _float(raw, "deemphasis_tau")
+            deemphasis = DeemphasisConfig(enabled=tau > 0, tau=tau)
+        else:
+            deemphasis = parse_deemphasis_config(raw.get("deemphasis"))
+        validate_deemphasis_config(deemphasis)
+    except (ConfigError, KeyError, TypeError, ValueError) as exc:
+        errors.append(f"deemphasis: {exc}")
+        deemphasis = current.deemphasis
+
+    try:
+        volume = parse_volume_config(raw.get("volume"))
+        validate_volume_config(volume)
+    except (ConfigError, KeyError, TypeError, ValueError) as exc:
+        errors.append(f"volume: {exc}")
+        volume = current.volume
+
+    try:
+        highpass = parse_filter_config(raw.get("highpass"))
+        validate_filter_config("highpass", highpass)
+        if highpass != current.highpass:
+            changed_filters.add("highpass")
+    except (ConfigError, KeyError, TypeError, ValueError) as exc:
+        errors.append(f"highpass: {exc}")
+        highpass = current.highpass
+
+    try:
+        lowpass = parse_filter_config(raw.get("lowpass"))
+        validate_filter_config("lowpass", lowpass)
+        if lowpass != current.lowpass:
+            changed_filters.add("lowpass")
+    except (ConfigError, KeyError, TypeError, ValueError) as exc:
+        errors.append(f"lowpass: {exc}")
+        lowpass = current.lowpass
+
+    try:
+        notch = parse_filter_config(raw.get("notch"))
+        validate_filter_config("notch", notch)
+        if notch != current.notch:
+            changed_filters.add("notch")
+    except (ConfigError, KeyError, TypeError, ValueError) as exc:
+        errors.append(f"notch: {exc}")
+        notch = current.notch
+
+    audio = AudioConfig(
+        deemphasis=deemphasis,
+        volume=volume,
+        highpass=highpass,
+        lowpass=lowpass,
+        notch=notch,
+    )
+    audio, relationship_errors = _merge_valid_audio_filter_relationships(
+        audio,
+        current,
+        changed_filters,
+    )
+    errors.extend(relationship_errors)
+    return audio, errors
+
+
+def parse_deemphasis_config(raw: Any) -> DeemphasisConfig:
+    if raw is None:
+        return DeemphasisConfig()
+    raw = _object(raw, "audio.deemphasis")
+    return DeemphasisConfig(
+        enabled=_bool(raw, "enabled", True),
+        tau=float(raw.get("tau", 530.0)),
+    )
+
+
+def parse_volume_config(raw: Any) -> VolumeConfig:
+    if raw is None:
+        return VolumeConfig()
+    raw = _object(raw, "audio.volume")
+    return VolumeConfig(
+        enabled=_bool(raw, "enabled", False),
+        multiplier=float(raw.get("multiplier", 1.0)),
+    )
+
+
+def parse_filter_config(raw: Any) -> FilterConfig:
+    if raw is None:
+        return FilterConfig()
+    raw = _object(raw, "audio filter")
+    return FilterConfig(
+        enabled=_bool(raw, "enabled", False),
+        frequency=float(raw.get("frequency", 0.0)),
+        sharpness=float(raw.get("sharpness", 0.0)),
+    )
 
 
 def validate_config(config: AppConfig) -> None:
     validate_station_config(config.station)
     validate_csdr_server_config(config.csdr_server)
-    validate_icecast_config(config.icecast)
+    validate_icecast_configs(config.icecast)
     validate_audio_config(config.audio)
 
 
@@ -232,9 +406,170 @@ def validate_icecast_config(config: IcecastConfig) -> None:
         raise ConfigError("; ".join(output_errors))
 
 
+def validate_icecast_configs(configs: tuple[IcecastConfig, ...]) -> None:
+    if not configs:
+        raise ConfigError("icecast must define at least one destination")
+    errors: list[str] = []
+    for index, config in enumerate(configs):
+        try:
+            validate_icecast_config(config)
+        except ConfigError as exc:
+            errors.append(f"icecast destination {index}: {exc}")
+    if errors:
+        raise ConfigError("; ".join(errors))
+
+
 def validate_audio_config(config: AudioConfig) -> None:
-    if not 0 <= config.deemphasis_tau <= 530:
-        raise ConfigError("audio.deemphasis_tau must be between 0 and 530")
+    validate_deemphasis_config(config.deemphasis)
+    validate_volume_config(config.volume)
+    validate_filter_config("highpass", config.highpass)
+    validate_filter_config("lowpass", config.lowpass)
+    validate_filter_config("notch", config.notch)
+    validate_audio_filter_relationships(config)
+
+
+def validate_deemphasis_config(config: DeemphasisConfig) -> None:
+    if not _finite(config.tau) or not 0 <= config.tau <= 530:
+        raise ConfigError("tau must be between 0 and 530")
+
+
+def validate_volume_config(config: VolumeConfig) -> None:
+    if not _finite(config.multiplier) or config.multiplier < 0:
+        raise ConfigError("multiplier must be a finite number greater than or equal to 0")
+
+
+def validate_filter_config(name: str, config: FilterConfig) -> None:
+    if not config.enabled:
+        return
+    if not _finite(config.frequency) or not 0 < config.frequency < AUDIO_NYQUIST_HZ:
+        raise ConfigError(f"{name}.frequency must be between 0 and {AUDIO_NYQUIST_HZ}")
+    if not _finite(config.sharpness) or not 0 <= config.sharpness <= 10:
+        raise ConfigError(f"{name}.sharpness must be between 0 and 10")
+    if name == "highpass" and config.frequency > SAME_ATTENTION_BAND_HZ[0]:
+        raise ConfigError(
+            f"highpass.frequency must be no higher than {SAME_ATTENTION_BAND_HZ[0]} Hz"
+        )
+    if name == "lowpass" and config.frequency < SAME_MARK_BAND_HZ[1]:
+        raise ConfigError(
+            f"lowpass.frequency must be no lower than {SAME_MARK_BAND_HZ[1]} Hz"
+        )
+    if name == "notch":
+        for label, (minimum, maximum) in PROTECTED_AUDIO_BANDS_HZ:
+            if minimum <= config.frequency <= maximum:
+                raise ConfigError(
+                    f"notch.frequency cannot be inside the protected {minimum}-{maximum} Hz "
+                    f"band for the {label}"
+                )
+
+
+def validate_audio_filter_relationships(config: AudioConfig) -> None:
+    errors = _audio_filter_relationship_errors(config)
+    if errors:
+        raise ConfigError("; ".join(errors))
+
+
+def _audio_filter_relationship_errors(config: AudioConfig) -> list[str]:
+    if not config.notch.enabled:
+        return []
+    errors: list[str] = []
+    if (
+        config.highpass.enabled
+        and config.notch.frequency <= config.highpass.frequency
+    ):
+        errors.append(
+            "notch.frequency must be greater than highpass.frequency "
+            "when both filters are enabled"
+        )
+    if (
+        config.lowpass.enabled
+        and config.notch.frequency >= config.lowpass.frequency
+    ):
+        errors.append(
+            "notch.frequency must be less than lowpass.frequency "
+            "when both filters are enabled"
+        )
+    return errors
+
+
+def _merge_valid_audio_filter_relationships(
+    audio: AudioConfig,
+    current: AudioConfig,
+    changed_filters: set[str],
+) -> tuple[AudioConfig, list[str]]:
+    errors = _audio_filter_relationship_errors(audio)
+    if not errors:
+        return audio, []
+
+    highpass = audio.highpass
+    lowpass = audio.lowpass
+    notch = audio.notch
+    reload_errors: list[str] = []
+
+    if notch.enabled and highpass.enabled and notch.frequency <= highpass.frequency:
+        if "notch" in changed_filters:
+            reload_errors.append(
+                "notch: notch.frequency must be greater than highpass.frequency "
+                "when both filters are enabled"
+            )
+            notch = current.notch
+        elif "highpass" in changed_filters:
+            reload_errors.append(
+                "highpass: highpass.frequency must be less than notch.frequency "
+                "when both filters are enabled"
+            )
+            highpass = current.highpass
+        else:
+            reload_errors.append(
+                "notch: notch.frequency must be greater than highpass.frequency "
+                "when both filters are enabled"
+            )
+            notch = current.notch
+
+    candidate = AudioConfig(
+        deemphasis=audio.deemphasis,
+        volume=audio.volume,
+        highpass=highpass,
+        lowpass=lowpass,
+        notch=notch,
+    )
+    if notch.enabled and lowpass.enabled and notch.frequency >= lowpass.frequency:
+        if "notch" in changed_filters:
+            reload_errors.append(
+                "notch: notch.frequency must be less than lowpass.frequency "
+                "when both filters are enabled"
+            )
+            notch = current.notch
+        elif "lowpass" in changed_filters:
+            reload_errors.append(
+                "lowpass: lowpass.frequency must be greater than notch.frequency "
+                "when both filters are enabled"
+            )
+            lowpass = current.lowpass
+        else:
+            reload_errors.append(
+                "notch: notch.frequency must be less than lowpass.frequency "
+                "when both filters are enabled"
+            )
+            notch = current.notch
+
+    candidate = AudioConfig(
+        deemphasis=audio.deemphasis,
+        volume=audio.volume,
+        highpass=highpass,
+        lowpass=lowpass,
+        notch=notch,
+    )
+    remaining_errors = _audio_filter_relationship_errors(candidate)
+    if remaining_errors:
+        reload_errors.extend(f"notch: {error}" for error in remaining_errors)
+        candidate = AudioConfig(
+            deemphasis=audio.deemphasis,
+            volume=audio.volume,
+            highpass=current.highpass,
+            lowpass=current.lowpass,
+            notch=current.notch,
+        )
+    return candidate, reload_errors
 
 
 def _output_config_errors(config: IcecastConfig) -> list[str]:
@@ -276,6 +611,12 @@ def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     return value
 
 
+def _object(value: Any, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be an object")
+    return value
+
+
 def _str(raw: dict[str, Any], key: str) -> str:
     value = raw.get(key)
     if not isinstance(value, str) or not value:
@@ -297,6 +638,24 @@ def _int(raw: dict[str, Any], key: str) -> int:
     if not isinstance(value, int):
         raise ConfigError(f"{key} must be an integer")
     return value
+
+
+def _float(raw: dict[str, Any], key: str) -> float:
+    value = raw.get(key)
+    if not isinstance(value, (int, float)):
+        raise ConfigError(f"{key} must be a number")
+    return float(value)
+
+
+def _bool(raw: dict[str, Any], key: str, default: bool) -> bool:
+    value = raw.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"{key} must be a boolean")
+    return value
+
+
+def _finite(value: float) -> bool:
+    return math.isfinite(value)
 
 
 def _mount(value: str) -> str:
