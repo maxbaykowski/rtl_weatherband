@@ -3,9 +3,7 @@ from __future__ import annotations
 import logging
 import queue
 import select
-import signal
 import socket
-import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -21,6 +19,7 @@ from .config import (
 )
 from .csdr_server import CsdrServerError, IqStream, open_iq_stream
 from .deemphasis import DeemphasisFilter
+from .encoder import AudioEncoder, create_audio_encoder
 from .nfm import NfmDemodulator, float_to_s16
 
 
@@ -51,7 +50,7 @@ class StreamPipeline:
     icecast: IcecastConfig
     csdr_server: CsdrServerConfig
     frequency_hz: int
-    processes: list[tuple[str, subprocess.Popen[bytes]]] = field(default_factory=list)
+    encoder: AudioEncoder | None = None
     producer_thread: threading.Thread | None = None
     writer_thread: threading.Thread | None = None
     stream_error: BaseException | None = None
@@ -66,29 +65,23 @@ class StreamPipeline:
     )
 
     def start(self, encoded_output: BinaryIO) -> None:
-        ffmpeg = subprocess.Popen(
-            self._ffmpeg_command(),
-            stdin=subprocess.PIPE,
-            stdout=encoded_output,
-            stderr=None,
-        )
-        self.processes = [("ffmpeg encoder", ffmpeg)]
+        self.encoder = create_audio_encoder(self.icecast)
         self.producer_thread = threading.Thread(
             target=self._run_iq_producer,
             name="numpy-nfm-producer",
             daemon=True,
         )
         self.writer_thread = threading.Thread(
-            target=self._run_pcm_writer,
-            args=(ffmpeg.stdin,),
-            name="pcm-silence-writer",
+            target=self._run_encoded_writer,
+            args=(encoded_output,),
+            name="encoded-audio-writer",
             daemon=True,
         )
         self.producer_thread.start()
         self.writer_thread.start()
 
     def wait(self) -> ProcessExit:
-        if not self.processes:
+        if self.writer_thread is None:
             raise PipelineError("pipeline was not started")
         while True:
             process_exit = self.poll_exit()
@@ -99,13 +92,9 @@ class StreamPipeline:
     def poll_exit(self) -> ProcessExit | None:
         if self.writer_thread is not None and not self.writer_thread.is_alive():
             return ProcessExit(
-                stage="pcm writer",
+                stage="encoded audio writer",
                 returncode=1 if self.stream_error is not None else 0,
             )
-        for stage, process in self.processes:
-            returncode = process.poll()
-            if returncode is not None:
-                return ProcessExit(stage=stage, returncode=returncode)
         return None
 
     def stop(self) -> None:
@@ -120,14 +109,12 @@ class StreamPipeline:
         if hotswap_result is not None:
             _, iq_stream, _ = hotswap_result
             iq_stream.close()
-        for _, process in reversed(self.processes):
-            if process.poll() is None:
-                process.send_signal(signal.SIGTERM)
-        for _, process in reversed(self.processes):
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
+        if self.producer_thread is not None:
+            self.producer_thread.join(timeout=2)
+        if self.writer_thread is not None:
+            self.writer_thread.join(timeout=2)
+        if self.encoder is not None:
+            self.encoder.close()
 
     def apply_runtime_config(self, config: AppConfig) -> AppConfig:
         applied = AppConfig(
@@ -342,12 +329,15 @@ class StreamPipeline:
             raise ConnectionError("replacement IQ stream socket closed")
         return chunk
 
-    def _run_pcm_writer(self, pcm_sink: BinaryIO | None) -> None:
-        if pcm_sink is None:
+    def _run_encoded_writer(self, encoded_sink: BinaryIO | None) -> None:
+        if encoded_sink is None or self.encoder is None:
             return
         pending = bytearray()
         next_write_at = time.monotonic()
         try:
+            header = getattr(self.encoder, "header", b"")
+            if header:
+                encoded_sink.write(header)
             while not self.stop_event.is_set():
                 self._drain_pcm_queue(pending)
                 if len(pending) >= PCM_FRAME_BYTES:
@@ -355,7 +345,9 @@ class StreamPipeline:
                     del pending[:PCM_FRAME_BYTES]
                 else:
                     frame = SILENCE_FRAME
-                pcm_sink.write(frame)
+                encoded = self.encoder.encode(frame)
+                if encoded:
+                    encoded_sink.write(encoded)
 
                 next_write_at += SILENCE_FRAME_SECONDS
                 delay = next_write_at - time.monotonic()
@@ -363,11 +355,16 @@ class StreamPipeline:
                     time.sleep(delay)
                 else:
                     next_write_at = time.monotonic()
+            encoded = self.encoder.flush()
+            if encoded:
+                encoded_sink.write(encoded)
         except (BrokenPipeError, OSError) as exc:
+            self.stream_error = exc
+        except Exception as exc:
             self.stream_error = exc
         finally:
             try:
-                pcm_sink.close()
+                encoded_sink.close()
             except OSError:
                 pass
 
@@ -445,37 +442,6 @@ class StreamPipeline:
             except OSError:
                 pass
             return False
-
-    def _ffmpeg_command(self) -> list[str]:
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-f",
-            "s16le",
-            "-ar",
-            str(IQ_SAMPLE_RATE),
-            "-ac",
-            "1",
-            "-i",
-            "pipe:0",
-            "-vn",
-            "-ar",
-            str(self.icecast.sample_rate),
-            "-ac",
-            "1",
-            "-b:a",
-            f"{self.icecast.bitrate}k",
-        ]
-        if self.icecast.format == "mp3":
-            command.extend(["-f", "mp3", "-codec:a", "libmp3lame", "pipe:1"])
-        elif self.icecast.format == "ogg":
-            command.extend(["-f", "ogg", "-codec:a", "libvorbis", "pipe:1"])
-        else:
-            raise PipelineError(f"unsupported icecast format: {self.icecast.format}")
-        return command
-
 
 def _station_from_frequency_hz(frequency_hz: int) -> StationConfig:
     return StationConfig(frequency=frequency_hz / 1_000_000)

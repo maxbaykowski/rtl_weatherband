@@ -21,6 +21,16 @@ MP3_BITRATE_LIMITS_BY_SAMPLE_RATE = {
     44100: (32, 320),
     48000: (32, 320),
 }
+OGG_BITRATE_LIMITS_BY_SAMPLE_RATE = {
+    8000: (8, 42),
+    11025: (12, 50),
+    16000: (16, 100),
+    22050: (16, 90),
+    24000: (16, 90),
+    32000: (30, 190),
+    44100: (32, 240),
+    48000: (32, 240),
+}
 
 
 class ConfigError(ValueError):
@@ -245,6 +255,16 @@ def _output_config_errors(config: IcecastConfig) -> list[str]:
             errors.append(
                 "invalid bitrate: icecast.bitrate must be between "
                 f"{minimum} and {maximum} Kbps for MP3 at {sample_rate} Hz"
+            )
+    elif (
+        config.format == "ogg"
+        and sample_rate in OGG_BITRATE_LIMITS_BY_SAMPLE_RATE
+    ):
+        minimum, maximum = OGG_BITRATE_LIMITS_BY_SAMPLE_RATE[sample_rate]
+        if not minimum <= bitrate <= maximum:
+            errors.append(
+                "invalid bitrate: icecast.bitrate must be between "
+                f"{minimum} and {maximum} Kbps for Ogg Vorbis at {sample_rate} Hz"
             )
     return errors
 

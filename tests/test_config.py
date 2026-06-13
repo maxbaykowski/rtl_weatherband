@@ -100,10 +100,18 @@ class ConfigTests(unittest.TestCase):
         raw = valid_config()
         raw["icecast"]["format"] = "ogg"
         raw["icecast"]["sample_rate"] = 48000
-        raw["icecast"]["bitrate"] = 500
+        raw["icecast"]["bitrate"] = 64
         config = parse_config(raw)
         self.assertEqual(config.icecast.sample_rate, 48000)
-        self.assertEqual(config.icecast.bitrate, 500)
+        self.assertEqual(config.icecast.bitrate, 64)
+
+    def test_rejects_ogg_managed_bitrate_above_sample_rate_limit(self) -> None:
+        raw = valid_config()
+        raw["icecast"]["format"] = "ogg"
+        raw["icecast"]["sample_rate"] = 16000
+        raw["icecast"]["bitrate"] = 128
+        with self.assertRaisesRegex(ConfigError, "16 and 100 Kbps"):
+            parse_config(raw)
 
     def test_reports_sample_rate_and_bitrate_together(self) -> None:
         raw = valid_config()

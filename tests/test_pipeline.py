@@ -25,6 +25,22 @@ class PcmSink:
         self.closed = True
 
 
+class FakeEncoder:
+    header = b""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def encode(self, pcm: bytes) -> bytes:
+        return pcm
+
+    def flush(self) -> bytes:
+        return b""
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class PipelineTests(unittest.TestCase):
     def make_pipeline(self) -> StreamPipeline:
         return StreamPipeline(
@@ -43,62 +59,13 @@ class PipelineTests(unittest.TestCase):
             162_550_000,
         )
 
-    def test_mp3_ffmpeg_command(self) -> None:
-        pipeline = self.make_pipeline()
-        self.assertEqual(
-            pipeline._ffmpeg_command(),
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-f",
-                "s16le",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-i",
-                "pipe:0",
-                "-vn",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-b:a",
-                "32k",
-                "-f",
-                "mp3",
-                "-codec:a",
-                "libmp3lame",
-                "pipe:1",
-            ],
-        )
-
-    def test_ogg_ffmpeg_command(self) -> None:
-        pipeline = StreamPipeline(
-            AudioConfig(),
-            IcecastConfig(
-                host="127.0.0.1",
-                port=8000,
-                mount="/nwr.ogg",
-                username="source",
-                password="hackme",
-                format="ogg",
-                sample_rate=22050,
-                bitrate=40,
-            ),
-            CsdrServerConfig(host="127.0.0.1", port=4951),
-            162_550_000,
-        )
-        self.assertIn("libvorbis", pipeline._ffmpeg_command())
-
     def test_pcm_writer_outputs_silence_when_no_audio_is_available(self) -> None:
         sink = PcmSink()
         pipeline = self.make_pipeline()
+        pipeline.encoder = FakeEncoder()
         try:
             thread = threading.Thread(
-                target=pipeline._run_pcm_writer,
+                target=pipeline._run_encoded_writer,
                 args=(sink,),
             )
             thread.start()

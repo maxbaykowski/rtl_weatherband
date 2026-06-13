@@ -4,14 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rtl_weatherband"
-version = "0.1.0"
+version = "0.2.0"
 description = "Stream NOAA Weather Radio audio from csdr_server IQ data to Icecast."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "csdr-server @ git+https://github.com/maxbaykowski/csdr_server.git@main",
   "json5>=0.9.0",
+  "lameenc>=1.8.2",
   "numpy>=1.26",
+  "PyOgg>=0.6.14a1",
+  "soxr>=1.1.0",
 ]
 
 [project.scripts]
