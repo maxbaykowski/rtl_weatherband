@@ -393,7 +393,7 @@ class StreamPipeline:
         iq_stream = self.active_iq_stream
         if iq_stream is None:
             raise ConnectionError("IQ stream is not active")
-        demodulator = NfmDemodulator()
+        demodulator = NfmDemodulator(iq_stream.iq_format)
         audio_config = self._audio_config()
         effects = AudioEffectsProcessor(audio_config)
         while not self.stop_event.is_set():
@@ -401,7 +401,7 @@ class StreamPipeline:
             if replacement is not None:
                 iq_stream, chunk = replacement
                 iq_socket = iq_stream.stream_socket
-                demodulator = NfmDemodulator()
+                demodulator = NfmDemodulator(iq_stream.iq_format)
                 audio_config = self._audio_config()
                 effects = AudioEffectsProcessor(audio_config)
                 self._process_iq_chunk(chunk, demodulator, effects)

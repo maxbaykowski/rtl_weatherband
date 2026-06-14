@@ -35,6 +35,16 @@ class NfmTests(unittest.TestCase):
         self.assertEqual(len(first), 0)
         np.testing.assert_allclose(second, [0.5, 0.5], rtol=1e-6, atol=1e-6)
 
+    def test_demodulates_s16_iq(self) -> None:
+        iq = np.array([1 + 0j, 0 + 1j, -1 + 0j], dtype=np.complex64)
+        interleaved = np.empty(len(iq) * 2, dtype="<i2")
+        interleaved[0::2] = np.round(iq.real * 32767).astype("<i2")
+        interleaved[1::2] = np.round(iq.imag * 32767).astype("<i2")
+
+        demodulated = NfmDemodulator("s16").process(interleaved.tobytes())
+
+        np.testing.assert_allclose(demodulated, [0.5, 0.5], rtol=1e-6, atol=1e-6)
+
     def test_float_to_s16_clips_output(self) -> None:
         pcm = np.frombuffer(
             float_to_s16(np.array([-2.0, 0.0, 2.0], dtype=np.float32)),
@@ -45,4 +55,3 @@ class NfmTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -6,6 +6,12 @@
     port: 7355,
     // Timeout, in seconds, before attempting to reconnect after connection drops.
     timeout: 10,
+    /*
+    IQ sample format requested from csdr_server.
+    "f32" is the default and keeps the most precision.
+    "s16" uses about half the network bandwidth; rtl_weatherband converts it back to float internally for DSP.
+    */
+    iq_format: "f32",
   },
 
   station: {

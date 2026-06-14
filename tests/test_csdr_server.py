@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import socket
 import unittest
+from unittest.mock import patch
 
-from rtl_weatherband.csdr_server import CsdrServerError, IqStream
+from rtl_weatherband.config import CsdrServerConfig
+from rtl_weatherband.csdr_server import CsdrServerError, IqStream, open_iq_stream
 
 
 class FakeControlSocket:
@@ -24,9 +27,21 @@ class FakeControlSocket:
     def close(self) -> None:
         pass
 
+    def settimeout(self, timeout: float | None) -> None:
+        pass
+
 
 class FakeStreamSocket:
+    def __init__(self) -> None:
+        self.sent = bytearray()
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.extend(data)
+
     def close(self) -> None:
+        pass
+
+    def settimeout(self, timeout: float | None) -> None:
         pass
 
 
@@ -77,6 +92,25 @@ class IqStreamTests(unittest.TestCase):
 
         with self.assertRaisesRegex(CsdrServerError, "out of band"):
             stream.retune(162_475_000)
+
+    def test_open_iq_stream_requests_configured_s16_format(self) -> None:
+        stream_socket = FakeStreamSocket()
+        control_socket = FakeControlSocket(
+            b'{"status":"ok","mode":"iq","format":"s16"}\n'
+        )
+        config = CsdrServerConfig(host="127.0.0.1", port=4951, iq_format="s16")
+
+        with patch(
+            "rtl_weatherband.csdr_server.socket.create_connection",
+            side_effect=[stream_socket, control_socket],
+        ):
+            stream = open_iq_stream(config, 162_550_000)
+
+        request = json.loads(control_socket.sent.decode("utf-8"))
+        token = stream_socket.sent.decode("utf-8").strip()
+        self.assertEqual(request["stream_token"], token)
+        self.assertEqual(request["format"], "s16")
+        self.assertEqual(stream.iq_format, "s16")
 
 
 if __name__ == "__main__":

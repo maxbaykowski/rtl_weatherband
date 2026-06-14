@@ -50,6 +50,7 @@ class ConfigTests(unittest.TestCase):
         config = parse_config(valid_config())
         self.assertEqual(config.station.frequency_hz, 162_550_000)
         self.assertEqual(config.csdr_server.control_port, 4952)
+        self.assertEqual(config.csdr_server.iq_format, "f32")
         self.assertEqual(len(config.icecast), 1)
         self.assertEqual(config.icecast[0].mount, "/nwr.mp3")
         self.assertEqual(config.icecast[0].content_type, "audio/mpeg")
@@ -60,6 +61,18 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.fallback.silence_timeout_seconds, 30.0)
         self.assertEqual(config.fallback.loop_delay_seconds, 0.0)
         self.assertIsNone(config.fallback.path)
+
+    def test_accepts_s16_csdr_server_iq_format(self) -> None:
+        raw = valid_config()
+        raw["csdr_server"]["iq_format"] = "s16"
+        config = parse_config(raw)
+        self.assertEqual(config.csdr_server.iq_format, "s16")
+
+    def test_rejects_invalid_csdr_server_iq_format(self) -> None:
+        raw = valid_config()
+        raw["csdr_server"]["iq_format"] = "u8"
+        with self.assertRaisesRegex(ConfigError, "f32.*s16"):
+            parse_config(raw)
 
     def test_accepts_valid_custom_fallback_audio(self) -> None:
         raw = valid_config()

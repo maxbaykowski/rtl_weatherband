@@ -51,6 +51,7 @@ class CsdrServerConfig:
     host: str
     port: int
     timeout: float = 10.0
+    iq_format: str = "f32"
 
     @property
     def control_port(self) -> int:
@@ -227,6 +228,7 @@ def parse_csdr_server_config(raw: dict[str, Any]) -> CsdrServerConfig:
         host=_str(raw, "host"),
         port=_int(raw, "port"),
         timeout=float(raw.get("timeout", 10.0)),
+        iq_format=_str(raw, "iq_format", "f32").lower(),
     )
 
 
@@ -428,6 +430,8 @@ def validate_station_config(config: StationConfig) -> None:
 def validate_csdr_server_config(config: CsdrServerConfig) -> None:
     if config.port <= 0 or config.port > 65534:
         raise ConfigError("csdr_server.port must be from 1 through 65534")
+    if config.iq_format not in {"f32", "s16"}:
+        raise ConfigError("csdr_server.iq_format must be either 'f32' or 's16'")
 
 
 def validate_icecast_config(config: IcecastConfig) -> None:
@@ -666,8 +670,8 @@ def _object(value: Any, name: str) -> dict[str, Any]:
     return value
 
 
-def _str(raw: dict[str, Any], key: str) -> str:
-    value = raw.get(key)
+def _str(raw: dict[str, Any], key: str, default: str | None = None) -> str:
+    value = raw.get(key, default)
     if not isinstance(value, str) or not value:
         raise ConfigError(f"{key} must be a non-empty string")
     return value

@@ -17,6 +17,7 @@ class IqStream:
     stream_socket: socket.socket
     control_socket: socket.socket
     handshake: dict[str, object]
+    iq_format: str = "f32"
 
     def is_connected(self) -> bool:
         return _socket_is_connected(self.control_socket) and _socket_is_connected(
@@ -74,17 +75,17 @@ def open_iq_stream(config: CsdrServerConfig, frequency_hz: int) -> IqStream:
             "frequency": frequency_hz,
             "mode": "iq",
             "sample_rate": IQ_SAMPLE_RATE,
-            "format": "f32",
+            "format": config.iq_format,
         }
         control_sock.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
         handshake = _read_json_line(control_sock)
         if handshake.get("status") != "ok":
             raise CsdrServerError(str(handshake.get("error", handshake)))
-        if handshake.get("mode") != "iq" or handshake.get("format") != "f32":
+        if handshake.get("mode") != "iq" or handshake.get("format") != config.iq_format:
             raise CsdrServerError(f"unexpected csdr_server handshake: {handshake}")
         stream_sock.settimeout(None)
         control_sock.settimeout(None)
-        return IqStream(stream_sock, control_sock, handshake)
+        return IqStream(stream_sock, control_sock, handshake, config.iq_format)
     except Exception:
         stream_sock.close()
         if control_sock is not None:
