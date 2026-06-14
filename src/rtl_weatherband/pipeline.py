@@ -47,10 +47,23 @@ class ProcessExit:
 @dataclass
 class OutputWorker:
     config: IcecastConfig
+    encoder_group: EncoderWorker
+    encoded_queue: queue.Queue[bytes]
+    stop_event: threading.Event
+    thread: threading.Thread
+    error: BaseException | None = None
+
+
+@dataclass
+class EncoderWorker:
+    key: tuple[str, int, int]
+    config: IcecastConfig
     encoder: AudioEncoder
     pcm_queue: queue.Queue[bytes]
     stop_event: threading.Event
     thread: threading.Thread
+    outputs: list[OutputWorker] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock)
     error: BaseException | None = None
 
 
@@ -61,6 +74,7 @@ class StreamPipeline:
     csdr_server: CsdrServerConfig
     frequency_hz: int
     outputs: list[OutputWorker] = field(default_factory=list)
+    encoder_groups: list[EncoderWorker] = field(default_factory=list)
     producer_thread: threading.Thread | None = None
     stream_error: BaseException | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
@@ -79,6 +93,7 @@ class StreamPipeline:
             daemon=True,
         )
         self.outputs = []
+        self.encoder_groups = []
         for destination, encoded_output in zip(
             self.icecast, encoded_outputs, strict=True
         ):
@@ -86,6 +101,8 @@ class StreamPipeline:
                 self._create_output_worker(destination, encoded_output)
             )
         self.producer_thread.start()
+        for encoder_group in self.encoder_groups:
+            encoder_group.thread.start()
         for output in self.outputs:
             output.thread.start()
 
@@ -99,6 +116,12 @@ class StreamPipeline:
             time.sleep(0.25)
 
     def poll_exit(self) -> ProcessExit | None:
+        for index, encoder_group in enumerate(self.encoder_groups):
+            if not encoder_group.thread.is_alive():
+                return ProcessExit(
+                    stage=f"audio encoder {index}",
+                    returncode=1 if encoder_group.error is not None else 0,
+                )
         for index, output in enumerate(self.outputs):
             if not output.thread.is_alive():
                 return ProcessExit(
@@ -124,54 +147,134 @@ class StreamPipeline:
         for output in list(self.outputs):
             self._stop_output_worker(output)
         self.outputs = []
+        for encoder_group in list(self.encoder_groups):
+            self._stop_encoder_worker(encoder_group)
+        self.encoder_groups = []
 
     def apply_icecast_outputs(
         self,
         icecast: tuple[IcecastConfig, ...],
         remove_configs: list[IcecastConfig],
         additions: list[tuple[IcecastConfig, BinaryIO]],
+        stop_unused_encoders: bool = True,
     ) -> None:
+        LOG.debug(
+            "applying Icecast outputs: remove=%s add=%s stop_unused_encoders=%s",
+            [_icecast_label(config) for config in remove_configs],
+            [_icecast_label(config) for config, _ in additions],
+            stop_unused_encoders,
+        )
         for config in remove_configs:
             self._remove_output(config)
         for config, encoded_output in additions:
             output = self._create_output_worker(config, encoded_output)
             self.outputs.append(output)
             output.thread.start()
+            LOG.info("started Icecast writer for %s", _icecast_label(config))
+        if stop_unused_encoders:
+            self._stop_unused_encoder_workers()
         self.icecast = icecast
+        LOG.debug(
+            "Icecast outputs now active: %s",
+            [_icecast_label(output.config) for output in self.outputs],
+        )
 
     def _create_output_worker(
         self,
         config: IcecastConfig,
         encoded_output: BinaryIO,
     ) -> OutputWorker:
-        encoder = create_audio_encoder(config)
-        pcm_queue: queue.Queue[bytes] = queue.Queue(maxsize=PCM_QUEUE_CHUNKS)
+        encoder_group = self._get_or_create_encoder_worker(config)
         output = OutputWorker(
             config=config,
-            encoder=encoder,
-            pcm_queue=pcm_queue,
+            encoder_group=encoder_group,
+            encoded_queue=queue.Queue(maxsize=PCM_QUEUE_CHUNKS),
             stop_event=threading.Event(),
             thread=threading.Thread(),
         )
+        with encoder_group.lock:
+            encoder_group.outputs.append(output)
         output.thread = threading.Thread(
-            target=self._run_encoded_writer,
+            target=self._run_icecast_writer,
             args=(output, encoded_output),
             name=f"encoded-audio-writer-{config.host}:{config.port}{config.mount}",
             daemon=True,
         )
         return output
 
+    def _get_or_create_encoder_worker(self, config: IcecastConfig) -> EncoderWorker:
+        key = _encoder_key(config)
+        for encoder_group in self.encoder_groups:
+            if encoder_group.key == key:
+                LOG.debug(
+                    "reusing encoder group %s for %s",
+                    key,
+                    _icecast_label(config),
+                )
+                return encoder_group
+
+        LOG.info(
+            "creating encoder group %s for %s",
+            key,
+            _icecast_label(config),
+        )
+        encoder_group = EncoderWorker(
+            key=key,
+            config=config,
+            encoder=create_audio_encoder(config),
+            pcm_queue=queue.Queue(maxsize=PCM_QUEUE_CHUNKS),
+            stop_event=threading.Event(),
+            thread=threading.Thread(),
+        )
+        encoder_group.thread = threading.Thread(
+            target=self._run_encoder_worker,
+            args=(encoder_group,),
+            name=(
+                f"audio-encoder-{config.format}-{config.sample_rate}-"
+                f"{config.bitrate}"
+            ),
+            daemon=True,
+        )
+        self.encoder_groups.append(encoder_group)
+        if self.producer_thread is not None and self.producer_thread.is_alive():
+            encoder_group.thread.start()
+        return encoder_group
+
     def _remove_output(self, config: IcecastConfig) -> None:
         for output in list(self.outputs):
             if output.config == config:
                 self.outputs.remove(output)
                 self._stop_output_worker(output)
+                LOG.info("stopped Icecast writer for %s", _icecast_label(config))
                 return
+        LOG.debug(
+            "requested removal for %s but no matching output worker was active",
+            _icecast_label(config),
+        )
 
     def _stop_output_worker(self, output: OutputWorker) -> None:
         output.stop_event.set()
-        output.thread.join(timeout=2)
-        output.encoder.close()
+        if output.thread.ident is not None:
+            output.thread.join(timeout=2)
+        with output.encoder_group.lock:
+            if output in output.encoder_group.outputs:
+                output.encoder_group.outputs.remove(output)
+
+    def _stop_encoder_worker(self, encoder_group: EncoderWorker) -> None:
+        encoder_group.stop_event.set()
+        if encoder_group.thread.ident is not None:
+            encoder_group.thread.join(timeout=2)
+        encoder_group.encoder.close()
+        LOG.info("stopped encoder group %s", encoder_group.key)
+
+    def _stop_unused_encoder_workers(self) -> None:
+        for encoder_group in list(self.encoder_groups):
+            with encoder_group.lock:
+                has_outputs = bool(encoder_group.outputs)
+            if not has_outputs:
+                self.encoder_groups.remove(encoder_group)
+                LOG.debug("encoder group %s has no outputs; stopping", encoder_group.key)
+                self._stop_encoder_worker(encoder_group)
 
     def apply_runtime_config(self, config: AppConfig) -> AppConfig:
         applied = AppConfig(
@@ -386,29 +489,23 @@ class StreamPipeline:
             raise ConnectionError("replacement IQ stream socket closed")
         return chunk
 
-    def _run_encoded_writer(
+    def _run_encoder_worker(
         self,
-        output: OutputWorker,
-        encoded_sink: BinaryIO | None,
+        encoder_group: EncoderWorker,
     ) -> None:
-        if encoded_sink is None:
-            return
         pending = bytearray()
         next_write_at = time.monotonic()
         try:
-            header = getattr(output.encoder, "header", b"")
-            if header:
-                encoded_sink.write(header)
-            while not self.stop_event.is_set() and not output.stop_event.is_set():
-                self._drain_pcm_queue(output.pcm_queue, pending)
+            while not self.stop_event.is_set() and not encoder_group.stop_event.is_set():
+                self._drain_pcm_queue(encoder_group.pcm_queue, pending)
                 if len(pending) >= PCM_FRAME_BYTES:
                     frame = bytes(pending[:PCM_FRAME_BYTES])
                     del pending[:PCM_FRAME_BYTES]
                 else:
                     frame = SILENCE_FRAME
-                encoded = output.encoder.encode(frame)
+                encoded = encoder_group.encoder.encode(frame)
                 if encoded:
-                    encoded_sink.write(encoded)
+                    self._broadcast_encoded(encoder_group, encoded)
 
                 next_write_at += SILENCE_FRAME_SECONDS
                 delay = next_write_at - time.monotonic()
@@ -416,9 +513,30 @@ class StreamPipeline:
                     time.sleep(delay)
                 else:
                     next_write_at = time.monotonic()
-            encoded = output.encoder.flush()
+            encoded = encoder_group.encoder.flush()
             if encoded:
-                encoded_sink.write(encoded)
+                self._broadcast_encoded(encoder_group, encoded)
+        except Exception as exc:
+            encoder_group.error = exc
+
+    def _run_icecast_writer(
+        self,
+        output: OutputWorker,
+        encoded_sink: BinaryIO | None,
+    ) -> None:
+        if encoded_sink is None:
+            return
+        try:
+            header = getattr(output.encoder_group.encoder, "header", b"")
+            if header:
+                encoded_sink.write(header)
+            while not self.stop_event.is_set() and not output.stop_event.is_set():
+                try:
+                    encoded = output.encoded_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if encoded:
+                    encoded_sink.write(encoded)
         except (BrokenPipeError, OSError) as exc:
             output.error = exc
         except Exception as exc:
@@ -429,9 +547,36 @@ class StreamPipeline:
             except OSError:
                 pass
 
+    def _broadcast_encoded(
+        self,
+        encoder_group: EncoderWorker,
+        encoded: bytes,
+    ) -> None:
+        with encoder_group.lock:
+            outputs = list(encoder_group.outputs)
+        for output in outputs:
+            self._queue_encoded_for_output(output.encoded_queue, encoded)
+
     def _queue_pcm(self, pcm: bytes) -> None:
-        for output in list(self.outputs):
-            self._queue_pcm_for_output(output.pcm_queue, pcm)
+        for encoder_group in list(self.encoder_groups):
+            self._queue_pcm_for_output(encoder_group.pcm_queue, pcm)
+
+    def _queue_encoded_for_output(
+        self,
+        encoded_queue: queue.Queue[bytes],
+        encoded: bytes,
+    ) -> None:
+        try:
+            encoded_queue.put_nowait(encoded)
+        except queue.Full:
+            try:
+                encoded_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                encoded_queue.put_nowait(encoded)
+            except queue.Full:
+                pass
 
     def _queue_pcm_for_output(self, pcm_queue: queue.Queue[bytes], pcm: bytes) -> None:
         try:
@@ -514,3 +659,14 @@ class StreamPipeline:
 
 def _station_from_frequency_hz(frequency_hz: int) -> StationConfig:
     return StationConfig(frequency=frequency_hz / 1_000_000)
+
+
+def _encoder_key(config: IcecastConfig) -> tuple[str, int, int]:
+    return config.format, config.sample_rate, config.bitrate
+
+
+def _icecast_label(config: IcecastConfig) -> str:
+    return (
+        f"{config.format}@{config.sample_rate}Hz/{config.bitrate}kbps "
+        f"{config.username}@{config.host}:{config.port}{config.mount}"
+    )

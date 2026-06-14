@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import base64
+import logging
 import socket
 import ssl
 from dataclasses import dataclass
 from typing import BinaryIO
 
+from . import __version__
 from .config import IcecastConfig
+
+
+LOG = logging.getLogger(__name__)
 
 
 class IcecastError(RuntimeError):
@@ -20,6 +25,7 @@ class IcecastSource:
     timeout_seconds: float = 10.0
     _socket: socket.socket | None = None
     _file: BinaryIO | None = None
+    response_status_code: int | None = None
 
     def connect(self) -> BinaryIO:
         raw_sock = socket.create_connection(
@@ -34,11 +40,24 @@ class IcecastSource:
                 sock = raw_sock
             sock.sendall(self._request_headers())
             response = self._read_response(sock)
-            if not (
-                response.startswith("HTTP/1.0 200")
-                or response.startswith("HTTP/1.1 200")
-            ):
+            status_code = self._response_status_code(response)
+            LOG.debug(
+                "Icecast response from %s:%s%s: %s",
+                self.config.host,
+                self.config.port,
+                self.config.mount,
+                response,
+            )
+            if status_code != 200:
                 raise IcecastError(f"Icecast source connection rejected: {response}")
+            self.response_status_code = status_code
+            LOG.info(
+                "Icecast accepted source connection at %s:%s%s with HTTP %s",
+                self.config.host,
+                self.config.port,
+                self.config.mount,
+                status_code,
+            )
             self._socket = sock
             self._file = sock.makefile("wb", buffering=0)
             return self._file
@@ -67,7 +86,7 @@ class IcecastSource:
             f"Host: {self.config.host}:{self.config.port}",
             f"Authorization: Basic {auth}",
             f"Content-Type: {self.content_type}",
-            "User-Agent: rtl_weatherband/0.1.0",
+            f"User-Agent: rtl_weatherband/{__version__}",
             "Transfer-Encoding: identity",
             "Connection: close",
             f"Ice-Public: {1 if self.config.public else 0}",
@@ -95,3 +114,12 @@ class IcecastSource:
             raise IcecastError("Icecast closed the connection without a response")
         return first_line[0].decode("iso-8859-1", errors="replace")
 
+    @staticmethod
+    def _response_status_code(response: str) -> int:
+        parts = response.split(maxsplit=2)
+        if len(parts) < 2:
+            raise IcecastError(f"invalid Icecast response: {response}")
+        try:
+            return int(parts[1])
+        except ValueError as exc:
+            raise IcecastError(f"invalid Icecast response: {response}") from exc

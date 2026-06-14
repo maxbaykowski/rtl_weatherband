@@ -4,6 +4,7 @@ import logging
 import signal
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from typing import BinaryIO
@@ -17,8 +18,22 @@ LOG = logging.getLogger(__name__)
 RECONNECT_DELAY_SECONDS = 5
 
 
+@dataclass(frozen=True)
+class IcecastReloadPlan:
+    unchanged: tuple[IcecastConfig, ...]
+    replacements: tuple[tuple[IcecastConfig, IcecastConfig], ...]
+    pure_removes: tuple[IcecastConfig, ...]
+    pure_adds: tuple[IcecastConfig, ...]
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(self.replacements or self.pure_removes or self.pure_adds)
+
+
 def run(config: AppConfig, config_path: str | Path | None = None) -> None:
     reload_event = threading.Event()
+    pending_icecast_config: AppConfig | None = None
+    next_icecast_retry_at = 0.0
     if config_path is not None and hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, lambda _signum, _frame: reload_event.set())
         LOG.info("SIGHUP config reload enabled for %s", config_path)
@@ -57,16 +72,21 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
                     break
                 if reload_event.is_set() and config_path is not None:
                     reload_event.clear()
+                    LOG.info("SIGHUP received; reloading config from %s", config_path)
                     new_config = _load_reload_config(config_path, config)
+                    _log_reload_changes(config, new_config)
                     if new_config.icecast != config.icecast:
-                        if _apply_icecast_reload(
+                        pending_icecast_config = new_config
+                        if _retry_pending_icecast_reload(
                             pipeline,
                             icecast_sources,
-                            config.icecast,
-                            new_config.icecast,
-                            config.csdr_server.timeout,
+                            config,
+                            pending_icecast_config,
                         ):
-                            config = pipeline.apply_runtime_config(new_config)
+                            config = pipeline.apply_runtime_config(
+                                pending_icecast_config
+                            )
+                            pending_icecast_config = None
                         else:
                             config = pipeline.apply_runtime_config(
                                 AppConfig(
@@ -76,9 +96,29 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
                                     audio=new_config.audio,
                                 )
                             )
+                            next_icecast_retry_at = (
+                                time.monotonic() + RECONNECT_DELAY_SECONDS
+                            )
                     else:
+                        pending_icecast_config = None
                         config = pipeline.apply_runtime_config(new_config)
                     LOG.info("config reload applied")
+                if (
+                    pending_icecast_config is not None
+                    and time.monotonic() >= next_icecast_retry_at
+                ):
+                    if _retry_pending_icecast_reload(
+                        pipeline,
+                        icecast_sources,
+                        config,
+                        pending_icecast_config,
+                    ):
+                        config = pipeline.apply_runtime_config(pending_icecast_config)
+                        pending_icecast_config = None
+                    else:
+                        next_icecast_retry_at = (
+                            time.monotonic() + RECONNECT_DELAY_SECONDS
+                        )
                 time.sleep(0.25)
         except Exception as exc:
             LOG.warning(
@@ -99,6 +139,7 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
 
 
 def _load_reload_config(config_path: str | Path, current: AppConfig) -> AppConfig:
+    LOG.debug("loading reload config from %s", config_path)
     try:
         raw = load_raw_config(config_path)
     except Exception as exc:
@@ -107,7 +148,42 @@ def _load_reload_config(config_path: str | Path, current: AppConfig) -> AppConfi
     config, errors = merge_valid_reload_config(raw, current)
     for error in errors:
         LOG.error("config reload kept existing %s", error)
+    LOG.debug(
+        "reload config parsed: csdr=%s:%s frequency=%s icecast=%s audio=%r",
+        config.csdr_server.host,
+        config.csdr_server.port,
+        config.station.frequency_hz,
+        [_icecast_label(destination) for destination in config.icecast],
+        config.audio,
+    )
     return config
+
+
+def _retry_pending_icecast_reload(
+    pipeline: StreamPipeline,
+    icecast_sources: list[IcecastSource],
+    current: AppConfig,
+    pending: AppConfig,
+) -> bool:
+    LOG.info(
+        "attempting pending Icecast reload to %s",
+        [_icecast_label(config) for config in pending.icecast],
+    )
+    if _apply_icecast_reload(
+        pipeline,
+        icecast_sources,
+        current.icecast,
+        pending.icecast,
+        current.csdr_server.timeout,
+    ):
+        LOG.info("pending Icecast reload succeeded")
+        return True
+    LOG.warning(
+        "pending Icecast reload failed; keeping current destinations and retrying "
+        "in %s seconds",
+        RECONNECT_DELAY_SECONDS,
+    )
+    return False
 
 
 def _apply_icecast_reload(
@@ -117,67 +193,179 @@ def _apply_icecast_reload(
     new: tuple[IcecastConfig, ...],
     timeout: float,
 ) -> bool:
-    remove_configs, add_configs = _diff_icecast_destinations(current, new)
-    if not remove_configs and not add_configs:
+    plan = _icecast_reload_plan(current, new)
+    if not plan.has_changes:
+        LOG.debug(
+            "Icecast config reload found no destination changes; unchanged=%s",
+            [_icecast_label(config) for config in plan.unchanged],
+        )
         return True
 
     LOG.info(
-        "Icecast config reload: keeping %s destination(s), removing %s, adding %s",
-        len(current) - len(remove_configs),
-        len(remove_configs),
-        len(add_configs),
+        "Icecast config reload: keeping %s unchanged destination(s), replacing %s, "
+        "removing %s, adding %s",
+        len(plan.unchanged),
+        len(plan.replacements),
+        len(plan.pure_removes),
+        len(plan.pure_adds),
     )
-
+    LOG.debug(
+        "Icecast reload plan: unchanged=%s replacements=%s pure_removes=%s "
+        "pure_adds=%s",
+        [_icecast_label(config) for config in plan.unchanged],
+        [
+            {
+                "old": _icecast_label(old_config),
+                "new": _icecast_label(new_config),
+                "mode": (
+                    "disconnect-before-connect"
+                    if _icecast_identity(old_config) == _icecast_identity(new_config)
+                    else "connect-before-disconnect"
+                ),
+            }
+            for old_config, new_config in plan.replacements
+        ],
+        [_icecast_label(config) for config in plan.pure_removes],
+        [_icecast_label(config) for config in plan.pure_adds],
+    )
     additions: list[tuple[IcecastConfig, BinaryIO]] = []
     added_sources: list[IcecastSource] = []
-    changed_sources: list[IcecastSource] = []
-    changed_outputs_removed = False
-    changed_removes, changed_adds, pure_removes, pure_adds = (
-        _split_changed_icecast_destinations(remove_configs, add_configs)
-    )
+    removed_sources: list[IcecastSource] = []
+    preconnect_removes: list[IcecastConfig] = []
+    preconnect_sources: list[IcecastSource] = []
+    preconnect_outputs_removed = False
     try:
-        for config in pure_adds:
+        for old_config, new_config in plan.replacements:
+            if _icecast_identity(old_config) == _icecast_identity(new_config):
+                LOG.info(
+                    "Icecast reload will disconnect %s before reconnecting same mount",
+                    _icecast_label(old_config),
+                )
+                preconnect_removes.append(old_config)
+                continue
+            LOG.info(
+                "Icecast reload connecting replacement %s before dropping %s",
+                _icecast_label(new_config),
+                _icecast_label(old_config),
+            )
+            source, encoded_output = _connect_icecast(new_config, timeout)
+            added_sources.append(source)
+            additions.append((new_config, encoded_output))
+
+        for config in plan.pure_adds:
+            LOG.info("Icecast reload adding destination %s", _icecast_label(config))
             source, encoded_output = _connect_icecast(config, timeout)
             added_sources.append(source)
             additions.append((config, encoded_output))
 
-        if changed_removes:
-            changed_sources = _take_icecast_sources(icecast_sources, changed_removes)
-            pipeline.apply_icecast_outputs(
-                _remove_exact_configs(current, changed_removes),
-                changed_removes,
-                [],
+        if preconnect_removes:
+            preconnect_sources = _take_icecast_sources(
+                icecast_sources,
+                preconnect_removes,
             )
-            changed_outputs_removed = True
-            for source in changed_sources:
+            pipeline.apply_icecast_outputs(
+                _without_configs(current, preconnect_removes),
+                preconnect_removes,
+                [],
+                stop_unused_encoders=False,
+            )
+            preconnect_outputs_removed = True
+            for source in preconnect_sources:
+                LOG.info(
+                    "Icecast reload closing old same-mount destination %s",
+                    _icecast_label(source.config),
+                )
                 source.close()
 
-        for config in changed_adds:
-            source, encoded_output = _connect_icecast(config, timeout)
+        for old_config, new_config in plan.replacements:
+            if old_config not in preconnect_removes:
+                continue
+            LOG.info(
+                "Icecast reload reconnecting replacement %s after dropping %s",
+                _icecast_label(new_config),
+                _icecast_label(old_config),
+            )
+            source, encoded_output = _connect_icecast(new_config, timeout)
             added_sources.append(source)
-            additions.append((config, encoded_output))
+            additions.append((new_config, encoded_output))
 
-        removed_sources = _take_icecast_sources(icecast_sources, pure_removes)
-        pipeline.apply_icecast_outputs(new, remove_configs, additions)
+        postconnect_removes = [
+            old_config
+            for old_config, new_config in plan.replacements
+            if old_config not in preconnect_removes
+        ]
+        removed_sources = _take_icecast_sources(
+            icecast_sources,
+            [*plan.pure_removes, *postconnect_removes],
+        )
+        pipeline.apply_icecast_outputs(
+            new,
+            [*plan.pure_removes, *postconnect_removes, *preconnect_removes],
+            additions,
+        )
         for source in removed_sources:
+            LOG.info(
+                "Icecast reload closing old destination %s after replacement connected",
+                _icecast_label(source.config),
+            )
             source.close()
         icecast_sources.extend(added_sources)
+        LOG.info(
+            "Icecast reload applied: active destinations=%s",
+            [_icecast_label(config) for config in new],
+        )
         return True
     except Exception as exc:
         LOG.warning("Icecast config reload failed; keeping existing outputs: %s", exc)
         for source in added_sources:
             source.close()
-        if changed_outputs_removed:
-            _restore_removed_icecast_outputs(
+        if preconnect_outputs_removed:
+            _restore_changed_icecast_outputs(
                 pipeline,
                 icecast_sources,
                 current,
-                changed_removes,
+                preconnect_removes,
                 timeout,
             )
         else:
-            icecast_sources.extend(changed_sources)
+            icecast_sources.extend(removed_sources)
+            icecast_sources.extend(preconnect_sources)
         return False
+
+
+def _restore_changed_icecast_outputs(
+    pipeline: StreamPipeline,
+    icecast_sources: list[IcecastSource],
+    current: tuple[IcecastConfig, ...],
+    configs: list[IcecastConfig],
+    timeout: float,
+) -> None:
+    additions: list[tuple[IcecastConfig, BinaryIO]] = []
+    restored_sources: list[IcecastSource] = []
+    try:
+        for config in configs:
+            source, encoded_output = _connect_icecast(config, timeout)
+            restored_sources.append(source)
+            additions.append((config, encoded_output))
+        pipeline.apply_icecast_outputs(current, [], additions)
+        icecast_sources.extend(restored_sources)
+    except Exception as exc:
+        LOG.error("failed to restore previous Icecast output after reload error: %s", exc)
+        for source in restored_sources:
+            source.close()
+
+
+def _without_configs(
+    configs: tuple[IcecastConfig, ...],
+    remove_configs: list[IcecastConfig],
+) -> tuple[IcecastConfig, ...]:
+    remaining = list(configs)
+    for remove_config in remove_configs:
+        try:
+            remaining.remove(remove_config)
+        except ValueError:
+            pass
+    return tuple(remaining)
 
 
 def _connect_icecast(
@@ -195,7 +383,13 @@ def _connect_icecast(
         config.port,
         config.mount,
     )
-    return source, source.connect()
+    sink = source.connect()
+    LOG.debug(
+        "Icecast connection ready for %s; HTTP status=%s",
+        _icecast_label(config),
+        source.response_status_code,
+    )
+    return source, sink
 
 
 def _diff_icecast_destinations(
@@ -228,67 +422,88 @@ def _take_icecast_sources(
     return removed
 
 
-def _restore_removed_icecast_outputs(
-    pipeline: StreamPipeline,
-    icecast_sources: list[IcecastSource],
+def _icecast_reload_plan(
     current: tuple[IcecastConfig, ...],
-    configs: list[IcecastConfig],
-    timeout: float,
-) -> None:
-    additions: list[tuple[IcecastConfig, BinaryIO]] = []
-    restored_sources: list[IcecastSource] = []
-    try:
-        for config in configs:
-            source, encoded_output = _connect_icecast(config, timeout)
-            restored_sources.append(source)
-            additions.append((config, encoded_output))
-        pipeline.apply_icecast_outputs(current, [], additions)
-        icecast_sources.extend(restored_sources)
-    except Exception as exc:
-        LOG.error("failed to restore previous Icecast output after reload error: %s", exc)
-        for source in restored_sources:
-            source.close()
+    new: tuple[IcecastConfig, ...],
+) -> IcecastReloadPlan:
+    current_remaining = list(enumerate(current))
+    new_remaining = list(enumerate(new))
+    unchanged: list[IcecastConfig] = []
+    replacement_pairs: list[tuple[IcecastConfig, IcecastConfig]] = []
 
-
-def _split_changed_icecast_destinations(
-    remove_configs: list[IcecastConfig],
-    add_configs: list[IcecastConfig],
-) -> tuple[
-    list[IcecastConfig],
-    list[IcecastConfig],
-    list[IcecastConfig],
-    list[IcecastConfig],
-]:
-    changed_removes: list[IcecastConfig] = []
-    changed_adds: list[IcecastConfig] = []
-    pure_removes = list(remove_configs)
-    pure_adds = list(add_configs)
-    for remove_config in list(remove_configs):
-        for add_config in list(pure_adds):
-            if _icecast_identity(remove_config) == _icecast_identity(add_config):
-                changed_removes.append(remove_config)
-                changed_adds.append(add_config)
-                pure_removes.remove(remove_config)
-                pure_adds.remove(add_config)
+    for current_index, current_config in list(current_remaining):
+        for new_index, new_config in list(new_remaining):
+            if current_config == new_config:
+                unchanged.append(current_config)
+                current_remaining.remove((current_index, current_config))
+                new_remaining.remove((new_index, new_config))
                 break
-    return changed_removes, changed_adds, pure_removes, pure_adds
+
+    for current_index, current_config in list(current_remaining):
+        for new_index, new_config in list(new_remaining):
+            if _icecast_identity(current_config) == _icecast_identity(new_config):
+                replacement_pairs.append((current_config, new_config))
+                current_remaining.remove((current_index, current_config))
+                new_remaining.remove((new_index, new_config))
+                break
+
+    for current_index, current_config in list(current_remaining):
+        if current_index >= len(new):
+            continue
+        new_config = new[current_index]
+        indexed_new = (current_index, new_config)
+        if indexed_new not in new_remaining:
+            continue
+        replacement_pairs.append((current_config, new_config))
+        current_remaining.remove((current_index, current_config))
+        new_remaining.remove(indexed_new)
+
+    return IcecastReloadPlan(
+        unchanged=tuple(unchanged),
+        replacements=tuple(replacement_pairs),
+        pure_removes=tuple(config for _, config in current_remaining),
+        pure_adds=tuple(config for _, config in new_remaining),
+    )
 
 
-def _remove_exact_configs(
-    configs: tuple[IcecastConfig, ...],
-    remove_configs: list[IcecastConfig],
-) -> tuple[IcecastConfig, ...]:
-    remaining = list(configs)
-    for remove_config in remove_configs:
-        try:
-            remaining.remove(remove_config)
-        except ValueError:
-            pass
-    return tuple(remaining)
+def _icecast_identity(config: IcecastConfig) -> tuple[str, int, str]:
+    return config.host, config.port, config.mount
 
 
-def _icecast_identity(config: IcecastConfig) -> tuple[str, int, str, str]:
-    return config.host, config.port, config.mount, config.username
+def _icecast_label(config: IcecastConfig) -> str:
+    return (
+        f"{config.format}@{config.sample_rate}Hz/{config.bitrate}kbps "
+        f"{config.username}@{config.host}:{config.port}{config.mount}"
+    )
+
+
+def _log_reload_changes(current: AppConfig, new: AppConfig) -> None:
+    if new == current:
+        LOG.info("config reload parsed with no effective changes")
+        return
+    if new.csdr_server != current.csdr_server:
+        LOG.info(
+            "config reload changed csdr_server: %s:%s -> %s:%s",
+            current.csdr_server.host,
+            current.csdr_server.port,
+            new.csdr_server.host,
+            new.csdr_server.port,
+        )
+    if new.station != current.station:
+        LOG.info(
+            "config reload changed station frequency: %s Hz -> %s Hz",
+            current.station.frequency_hz,
+            new.station.frequency_hz,
+        )
+    if new.icecast != current.icecast:
+        LOG.info(
+            "config reload changed Icecast destinations: %s -> %s",
+            [_icecast_label(config) for config in current.icecast],
+            [_icecast_label(config) for config in new.icecast],
+        )
+    if new.audio != current.audio:
+        LOG.info("config reload changed audio settings")
+        LOG.debug("audio config changed from %r to %r", current.audio, new.audio)
 
 
 def _log_pipeline_exit(process_exit: ProcessExit) -> None:
