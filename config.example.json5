@@ -49,6 +49,25 @@
     ],
   },
 
+  fallback: {
+    /*
+    If rtl_weatherband has no demodulated audio for this many seconds, it will
+    play fallback audio while it keeps trying to reconnect to csdr_server.
+    Valid range: 30 through 120 seconds.
+    */
+    silence_timeout_seconds: 30,
+    /*
+    How long to wait after the fallback audio finishes before starting it again.
+    Set to 0 for a continuous loop with no gap.
+    */
+    loop_delay_seconds: 0,
+    /*
+    Optional path to a custom WAV file. Leave unset to use the packaged default.
+    Custom files must be mono, WAV, PCM signed 16-bit little-endian, and under 30 seconds.
+    */
+    // path: "/path/to/fallback.wav",
+  },
+
   audio: {
     // NFM deemphasis filter for reducing high frequency content.
     deemphasis: {
@@ -88,9 +107,8 @@
       */
       sharpness: 2,
     },
-    /*
-    Removes a narrow tone, useful for analog whines.
-    To protect the 1050 Hz attention tone and the SAME tones, the frequency cannot be within protected bands 900-1100, 1400-1600, or 2000-2200 Hz.
+    // Removes a narrow tone, useful for analog whines.
+    // To protect the 1050 Hz attention tone and the SAME tones, the frequency cannot be within protected bands 900-1100, 1400-1600, or 2000-2200 Hz.
     notch: {
       enabled: false,
       frequency: 3000,

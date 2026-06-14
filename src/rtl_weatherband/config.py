@@ -7,6 +7,9 @@ from typing import Any
 
 import json5
 
+from .config_errors import ConfigError
+from .fallback_audio import load_fallback_audio
+
 
 NOAA_MIN_MHZ = 162.4
 NOAA_MAX_MHZ = 162.55
@@ -41,10 +44,6 @@ PROTECTED_AUDIO_BANDS_HZ = (
     ("SAME mark tone", SAME_MARK_BAND_HZ),
 )
 AUDIO_NYQUIST_HZ = IQ_SAMPLE_RATE / 2
-
-
-class ConfigError(ValueError):
-    """Raised when the JSON5 configuration is invalid."""
 
 
 @dataclass(frozen=True)
@@ -125,11 +124,19 @@ class AudioConfig:
 
 
 @dataclass(frozen=True)
+class FallbackConfig:
+    silence_timeout_seconds: float = 30.0
+    loop_delay_seconds: float = 0.0
+    path: str | None = None
+
+
+@dataclass(frozen=True)
 class AppConfig:
     csdr_server: CsdrServerConfig
     station: StationConfig
     icecast: tuple[IcecastConfig, ...]
     audio: AudioConfig
+    fallback: FallbackConfig = field(default_factory=FallbackConfig)
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -152,12 +159,14 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
     station = _section(raw, "station")
     icecast = raw.get("icecast")
     audio = _section(raw, "audio")
+    fallback = raw.get("fallback")
 
     app = AppConfig(
         csdr_server=parse_csdr_server_config(csdr_server),
         station=parse_station_config(station),
         icecast=parse_icecast_configs(icecast),
         audio=parse_audio_config(audio),
+        fallback=parse_fallback_config(fallback),
     )
     validate_config(app)
     return app
@@ -197,11 +206,19 @@ def merge_valid_reload_config(
         errors.append(f"audio: {exc}")
         audio = current.audio
 
+    try:
+        fallback = parse_fallback_config(raw.get("fallback"))
+        validate_fallback_config(fallback)
+    except (ConfigError, KeyError, TypeError, ValueError) as exc:
+        errors.append(f"fallback: {exc}")
+        fallback = current.fallback
+
     return AppConfig(
         csdr_server=csdr_server,
         station=station,
         icecast=icecast,
         audio=audio,
+        fallback=fallback,
     ), errors
 
 
@@ -376,11 +393,28 @@ def parse_filter_config(raw: Any) -> FilterConfig:
     )
 
 
+def parse_fallback_config(raw: Any) -> FallbackConfig:
+    if raw is None:
+        return FallbackConfig()
+    raw = _object(raw, "fallback")
+    return FallbackConfig(
+        silence_timeout_seconds=float(
+            raw.get(
+                "silence_timeout_seconds",
+                raw.get("silence_allowed_seconds", 30.0),
+            )
+        ),
+        loop_delay_seconds=float(raw.get("loop_delay_seconds", 0.0)),
+        path=_optional_str(raw, "path"),
+    )
+
+
 def validate_config(config: AppConfig) -> None:
     validate_station_config(config.station)
     validate_csdr_server_config(config.csdr_server)
     validate_icecast_configs(config.icecast)
     validate_audio_config(config.audio)
+    validate_fallback_config(config.fallback)
 
 
 def validate_station_config(config: StationConfig) -> None:
@@ -466,6 +500,21 @@ def validate_audio_filter_relationships(config: AudioConfig) -> None:
     errors = _audio_filter_relationship_errors(config)
     if errors:
         raise ConfigError("; ".join(errors))
+
+
+def validate_fallback_config(config: FallbackConfig) -> None:
+    if (
+        not _finite(config.silence_timeout_seconds)
+        or not 30 <= config.silence_timeout_seconds <= 120
+    ):
+        raise ConfigError(
+            "fallback.silence_timeout_seconds must be between 30 and 120"
+        )
+    if not _finite(config.loop_delay_seconds) or config.loop_delay_seconds < 0:
+        raise ConfigError(
+            "fallback.loop_delay_seconds must be a finite number greater than or equal to 0"
+        )
+    load_fallback_audio(config.path)
 
 
 def _audio_filter_relationship_errors(config: AudioConfig) -> list[str]:

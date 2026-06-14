@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+import wave
 
 from rtl_weatherband.config import ConfigError, merge_valid_reload_config, parse_config
 
@@ -29,6 +31,20 @@ def valid_config() -> dict:
     }
 
 
+def _write_wave(
+    path: str,
+    channels: int = 1,
+    sample_width: int = 2,
+    sample_rate: int = 16000,
+    frames: int = 1600,
+) -> None:
+    with wave.open(path, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(sample_width)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\x00\x00" * frames * channels)
+
+
 class ConfigTests(unittest.TestCase):
     def test_parses_valid_config(self) -> None:
         config = parse_config(valid_config())
@@ -41,6 +57,51 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.icecast[0].bitrate, 32)
         self.assertTrue(config.audio.deemphasis.enabled)
         self.assertEqual(config.audio.deemphasis.tau, 530.0)
+        self.assertEqual(config.fallback.silence_timeout_seconds, 30.0)
+        self.assertEqual(config.fallback.loop_delay_seconds, 0.0)
+        self.assertIsNone(config.fallback.path)
+
+    def test_accepts_valid_custom_fallback_audio(self) -> None:
+        raw = valid_config()
+        with tempfile.NamedTemporaryFile(suffix=".wav") as fp:
+            _write_wave(fp.name)
+            raw["fallback"] = {
+                "path": fp.name,
+                "silence_timeout_seconds": 45,
+                "loop_delay_seconds": 2.5,
+            }
+
+            config = parse_config(raw)
+
+        self.assertEqual(config.fallback.path, fp.name)
+        self.assertEqual(config.fallback.silence_timeout_seconds, 45)
+        self.assertEqual(config.fallback.loop_delay_seconds, 2.5)
+
+    def test_rejects_fallback_timeout_below_minimum(self) -> None:
+        raw = valid_config()
+        raw["fallback"] = {
+            "silence_timeout_seconds": 29,
+        }
+        with self.assertRaisesRegex(ConfigError, "between 30 and 120"):
+            parse_config(raw)
+
+    def test_rejects_invalid_custom_fallback_audio_path(self) -> None:
+        raw = valid_config()
+        raw["fallback"] = {
+            "path": "/tmp/rtl_weatherband_missing_fallback.wav",
+        }
+        with self.assertRaisesRegex(ConfigError, "No such file or directory"):
+            parse_config(raw)
+
+    def test_rejects_stereo_custom_fallback_audio(self) -> None:
+        raw = valid_config()
+        with tempfile.NamedTemporaryFile(suffix=".wav") as fp:
+            _write_wave(fp.name, channels=2)
+            raw["fallback"] = {
+                "path": fp.name,
+            }
+            with self.assertRaisesRegex(ConfigError, "mono"):
+                parse_config(raw)
 
     def test_parses_multiple_icecast_destinations(self) -> None:
         raw = valid_config()
@@ -267,6 +328,18 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.audio.volume.multiplier, 2.0)
         self.assertEqual(config.audio.notch, current.audio.notch)
         self.assertTrue(any("audio.notch:" in error for error in errors))
+
+    def test_reload_keeps_old_fallback_when_new_fallback_is_invalid(self) -> None:
+        current = parse_config(valid_config())
+        raw = valid_config()
+        raw["fallback"] = {
+            "path": "/tmp/rtl_weatherband_missing_fallback.wav",
+        }
+
+        config, errors = merge_valid_reload_config(raw, current)
+
+        self.assertEqual(config.fallback, current.fallback)
+        self.assertTrue(any("fallback:" in error for error in errors))
 
     def test_reload_keeps_changed_notch_when_it_crosses_highpass(self) -> None:
         current_raw = valid_config()

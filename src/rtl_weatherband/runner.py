@@ -46,6 +46,7 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
             config.icecast,
             config.csdr_server,
             config.station.frequency_hz,
+            config.fallback,
         )
         try:
             for destination in config.icecast:
@@ -94,6 +95,7 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
                                     station=new_config.station,
                                     icecast=config.icecast,
                                     audio=new_config.audio,
+                                    fallback=new_config.fallback,
                                 )
                             )
                             next_icecast_retry_at = (

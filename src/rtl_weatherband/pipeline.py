@@ -13,13 +13,15 @@ from .config import (
     AppConfig,
     AudioConfig,
     CsdrServerConfig,
+    FallbackConfig,
     IcecastConfig,
     IQ_SAMPLE_RATE,
     StationConfig,
 )
 from .csdr_server import CsdrServerError, IqStream, open_iq_stream
 from .audio_effects import AudioEffectsProcessor
-from .encoder import AudioEncoder, create_audio_encoder
+from .encoder import AudioEncoder, PcmResampler, create_audio_encoder
+from .fallback_audio import FallbackAudio, load_fallback_audio
 from .nfm import NfmDemodulator, float_to_s16
 
 
@@ -64,7 +66,20 @@ class EncoderWorker:
     thread: threading.Thread
     outputs: list[OutputWorker] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    fallback_state: FallbackPlaybackState = field(default_factory=lambda: FallbackPlaybackState())
     error: BaseException | None = None
+
+
+@dataclass
+class FallbackPlaybackState:
+    position: int = 0
+    delay_samples_remaining: int = 0
+    active: bool = False
+
+    def reset(self) -> None:
+        self.position = 0
+        self.delay_samples_remaining = 0
+        self.active = False
 
 
 @dataclass
@@ -73,6 +88,7 @@ class StreamPipeline:
     icecast: tuple[IcecastConfig, ...]
     csdr_server: CsdrServerConfig
     frequency_hz: int
+    fallback: FallbackConfig = field(default_factory=FallbackConfig)
     outputs: list[OutputWorker] = field(default_factory=list)
     encoder_groups: list[EncoderWorker] = field(default_factory=list)
     producer_thread: threading.Thread | None = None
@@ -83,6 +99,11 @@ class StreamPipeline:
     pending_receiver: tuple[CsdrServerConfig, int] | None = None
     hotswap_thread: threading.Thread | None = None
     hotswap_result: tuple[tuple[CsdrServerConfig, int], IqStream, bytes] | None = None
+    fallback_audio: FallbackAudio = field(init=False)
+    last_pcm_at: float = field(default_factory=time.monotonic)
+
+    def __post_init__(self) -> None:
+        self.fallback_audio = _load_pipeline_fallback_audio(self.fallback)
 
     def start(self, encoded_outputs: list[BinaryIO]) -> None:
         if len(encoded_outputs) != len(self.icecast):
@@ -282,9 +303,14 @@ class StreamPipeline:
             station=config.station,
             icecast=config.icecast,
             audio=config.audio,
+            fallback=config.fallback,
         )
         with self.state_lock:
             self.audio = config.audio
+            if config.fallback != self.fallback:
+                self.fallback = config.fallback
+                self.fallback_audio = _load_pipeline_fallback_audio(self.fallback)
+                LOG.info("updated fallback audio settings")
             server_changed = config.csdr_server != self.csdr_server
             frequency_changed = config.station.frequency_hz != self.frequency_hz
             if server_changed:
@@ -321,6 +347,7 @@ class StreamPipeline:
                     station=_station_from_frequency_hz(self.frequency_hz),
                     icecast=config.icecast,
                     audio=config.audio,
+                    fallback=config.fallback,
                 )
         else:
             with self.state_lock:
@@ -502,7 +529,7 @@ class StreamPipeline:
                     frame = bytes(pending[:PCM_FRAME_BYTES])
                     del pending[:PCM_FRAME_BYTES]
                 else:
-                    frame = SILENCE_FRAME
+                    frame = self._idle_pcm_frame(encoder_group)
                 encoded = encoder_group.encoder.encode(frame)
                 if encoded:
                     self._broadcast_encoded(encoder_group, encoded)
@@ -558,8 +585,39 @@ class StreamPipeline:
             self._queue_encoded_for_output(output.encoded_queue, encoded)
 
     def _queue_pcm(self, pcm: bytes) -> None:
+        with self.state_lock:
+            self.last_pcm_at = time.monotonic()
+        self._reset_fallback_states()
         for encoder_group in list(self.encoder_groups):
             self._queue_pcm_for_output(encoder_group.pcm_queue, pcm)
+
+    def _idle_pcm_frame(self, encoder_group: EncoderWorker) -> bytes:
+        with self.state_lock:
+            idle_seconds = time.monotonic() - self.last_pcm_at
+            fallback = self.fallback
+            fallback_audio = self.fallback_audio
+        state = encoder_group.fallback_state
+        if not state.active and idle_seconds < fallback.silence_timeout_seconds:
+            encoder_group.fallback_state.reset()
+            return SILENCE_FRAME
+        if not state.active:
+            state.active = True
+            LOG.info(
+                "starting fallback audio for encoder group %s after %.1f seconds without PCM",
+                encoder_group.key,
+                idle_seconds,
+            )
+        return _next_fallback_frame(
+            fallback_audio,
+            state,
+            fallback.loop_delay_seconds,
+        )
+
+    def _reset_fallback_states(self) -> None:
+        for encoder_group in list(self.encoder_groups):
+            if encoder_group.fallback_state.active:
+                LOG.info("stopping fallback audio for encoder group %s", encoder_group.key)
+            encoder_group.fallback_state.reset()
 
     def _queue_encoded_for_output(
         self,
@@ -670,3 +728,46 @@ def _icecast_label(config: IcecastConfig) -> str:
         f"{config.format}@{config.sample_rate}Hz/{config.bitrate}kbps "
         f"{config.username}@{config.host}:{config.port}{config.mount}"
     )
+
+
+def _load_pipeline_fallback_audio(config: FallbackConfig) -> FallbackAudio:
+    audio = load_fallback_audio(config.path)
+    if audio.sample_rate == IQ_SAMPLE_RATE:
+        return audio
+    resampler = PcmResampler(audio.sample_rate, IQ_SAMPLE_RATE)
+    pcm = resampler.process(audio.pcm) + resampler.flush()
+    return FallbackAudio(
+        sample_rate=IQ_SAMPLE_RATE,
+        pcm=pcm,
+        duration_seconds=len(pcm) / 2 / IQ_SAMPLE_RATE,
+        source=audio.source,
+    )
+
+
+def _next_fallback_frame(
+    audio: FallbackAudio,
+    state: FallbackPlaybackState,
+    loop_delay_seconds: float,
+) -> bytes:
+    if not audio.pcm:
+        return SILENCE_FRAME
+    output = bytearray()
+    delay_samples = round(loop_delay_seconds * IQ_SAMPLE_RATE)
+    while len(output) < PCM_FRAME_BYTES:
+        if state.delay_samples_remaining > 0:
+            remaining_samples = (PCM_FRAME_BYTES - len(output)) // 2
+            silence_samples = min(remaining_samples, state.delay_samples_remaining)
+            output.extend(b"\x00\x00" * silence_samples)
+            state.delay_samples_remaining -= silence_samples
+            continue
+
+        if state.position >= len(audio.pcm):
+            state.position = 0
+            if delay_samples > 0:
+                state.delay_samples_remaining = delay_samples
+                continue
+
+        chunk_size = min(PCM_FRAME_BYTES - len(output), len(audio.pcm) - state.position)
+        output.extend(audio.pcm[state.position : state.position + chunk_size])
+        state.position += chunk_size
+    return bytes(output)
