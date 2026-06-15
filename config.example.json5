@@ -7,16 +7,15 @@
     // Timeout, in seconds, before attempting to reconnect after connection drops.
     timeout: 10,
     /*
-    Audio buffer size in seconds. Use a low value for localhost.
-    For remote csdr_server connections, 5-10 seconds can smooth over short network dropouts.
-    If the buffer gets low, rtl_weatherband will briefly send silence while it refills.
-    This must be lower than fallback.silence_timeout_seconds.
+    Audio buffer size in seconds.
+    For connections to localhost set this to 1 second, for servers hosted over LAN or WAN use 5-10 seconds.
     */
     buffer_seconds: 1,
     /*
     IQ sample format requested from csdr_server.
-    "f32" is the default and keeps the most precision.
-    "s16" uses about half the network bandwidth; rtl_weatherband converts it back to float internally for DSP.
+    "f32" is the default and may give slightly better results.
+    "s16" uses about half the network bandwidth, but will use slightly more CPU.
+Keep as "f32" unless you're connecting to a csdr_server instance on LAN or WAN.
     */
     iq_format: "f32",
   },
@@ -35,7 +34,7 @@
         host: "127.0.0.1",
         // The port the server listens on.
         port: 8000,
-        // Enable if the icecast server uses TLS.
+        // Enable if the icecast server uses TLS (most don't).
         tls: false,
         // The mountpoint where the stream will be accessible to listeners.
         mount: "/nwr.mp3",
@@ -64,16 +63,15 @@
 
   fallback: {
     /*
-    If rtl_weatherband has no demodulated audio for this many seconds, it will
-    play fallback audio while it keeps trying to reconnect to csdr_server.
+Fallback audio will be played when the server stops producing data for a set amount of time.
     Valid range: 30 through 120 seconds.
     */
     silence_timeout_seconds: 30,
     /*
     How long to wait after the fallback audio finishes before starting it again.
-    Set to 0 for a continuous loop with no gap.
+    Set to 0 for a continuous loop with no gap. You probably want a few seconds of silence in most cases
     */
-    loop_delay_seconds: 0,
+    loop_delay_seconds: 5,
     /*
     Optional path to a custom WAV file. Leave unset to use the packaged default.
     Custom files must be mono, WAV, PCM signed 16-bit little-endian, and under 30 seconds.
