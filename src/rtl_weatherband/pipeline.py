@@ -38,6 +38,7 @@ SILENCE_FRAME = b"\x00\x00" * SILENCE_FRAME_SAMPLES
 PCM_FRAME_BYTES = len(SILENCE_FRAME)
 PCM_QUEUE_CHUNKS = 100
 RECONNECT_DELAY_SECONDS = 5
+PCM_BUFFER_LOW_WATER_RATIO = 0.25
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,8 @@ class EncoderWorker:
     outputs: list[OutputWorker] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     fallback_state: FallbackPlaybackState = field(default_factory=lambda: FallbackPlaybackState())
+    pcm_buffer_ready: bool = False
+    pcm_buffer_target_bytes: int = 0
     error: BaseException | None = None
 
 
@@ -298,20 +301,14 @@ class StreamPipeline:
                 self._stop_encoder_worker(encoder_group)
 
     def apply_runtime_config(self, config: AppConfig) -> AppConfig:
-        applied = AppConfig(
-            csdr_server=self.csdr_server,
-            station=config.station,
-            icecast=config.icecast,
-            audio=config.audio,
-            fallback=config.fallback,
-        )
+        applied = config
         with self.state_lock:
             self.audio = config.audio
             if config.fallback != self.fallback:
                 self.fallback = config.fallback
                 self.fallback_audio = _load_pipeline_fallback_audio(self.fallback)
                 LOG.info("updated fallback audio settings")
-            server_changed = config.csdr_server != self.csdr_server
+            server_changed = _csdr_connection_changed(config.csdr_server, self.csdr_server)
             frequency_changed = config.station.frequency_hz != self.frequency_hz
             if server_changed:
                 self.csdr_server = config.csdr_server
@@ -323,6 +320,7 @@ class StreamPipeline:
                     self.csdr_server.port,
                 )
                 return config
+            self.csdr_server = config.csdr_server
             if self.pending_receiver is not None:
                 self.frequency_hz = config.station.frequency_hz
                 self.pending_receiver = (self.csdr_server, self.frequency_hz)
@@ -404,7 +402,8 @@ class StreamPipeline:
                 demodulator = NfmDemodulator(iq_stream.iq_format)
                 audio_config = self._audio_config()
                 effects = AudioEffectsProcessor(audio_config)
-                self._process_iq_chunk(chunk, demodulator, effects)
+                if chunk:
+                    self._process_iq_chunk(chunk, demodulator, effects)
                 continue
             next_audio_config = self._audio_config()
             if next_audio_config != audio_config:
@@ -472,7 +471,7 @@ class StreamPipeline:
         csdr_server, frequency_hz = receiver
         try:
             replacement = open_iq_stream(csdr_server, frequency_hz)
-            chunk = self._read_first_iq_chunk(replacement, csdr_server.timeout)
+            self._read_hotswap_iq_probe(replacement, csdr_server.timeout)
         except Exception as exc:
             LOG.warning(
                 "csdr_server hotswap to %s:%s failed: %s; keeping current stream",
@@ -486,7 +485,7 @@ class StreamPipeline:
                 close_replacement = True
             else:
                 close_replacement = False
-                self.hotswap_result = (receiver, replacement, chunk)
+                self.hotswap_result = (receiver, replacement, b"")
         if close_replacement:
             replacement.close()
 
@@ -505,7 +504,11 @@ class StreamPipeline:
                 return None
             return result
 
-    def _read_first_iq_chunk(self, iq_stream: IqStream, timeout: float) -> bytes:
+    def _read_hotswap_iq_probe(
+        self,
+        iq_stream: IqStream,
+        timeout: float,
+    ) -> bytes:
         readable, _, _ = select.select([iq_stream.stream_socket], [], [], timeout)
         if not readable:
             iq_stream.close()
@@ -525,11 +528,12 @@ class StreamPipeline:
         try:
             while not self.stop_event.is_set() and not encoder_group.stop_event.is_set():
                 self._drain_pcm_queue(encoder_group.pcm_queue, pending)
-                if len(pending) >= PCM_FRAME_BYTES:
-                    frame = bytes(pending[:PCM_FRAME_BYTES])
-                    del pending[:PCM_FRAME_BYTES]
-                else:
+                self._apply_pcm_buffer_target(encoder_group, pending)
+                frame = self._next_buffered_pcm_frame(encoder_group, pending)
+                if frame is None:
                     frame = self._idle_pcm_frame(encoder_group)
+                else:
+                    self._mark_pcm_output()
                 encoded = encoder_group.encoder.encode(frame)
                 if encoded:
                     self._broadcast_encoded(encoder_group, encoded)
@@ -585,11 +589,13 @@ class StreamPipeline:
             self._queue_encoded_for_output(output.encoded_queue, encoded)
 
     def _queue_pcm(self, pcm: bytes) -> None:
+        for encoder_group in list(self.encoder_groups):
+            self._queue_pcm_for_output(encoder_group.pcm_queue, pcm)
+
+    def _mark_pcm_output(self) -> None:
         with self.state_lock:
             self.last_pcm_at = time.monotonic()
         self._reset_fallback_states()
-        for encoder_group in list(self.encoder_groups):
-            self._queue_pcm_for_output(encoder_group.pcm_queue, pcm)
 
     def _idle_pcm_frame(self, encoder_group: EncoderWorker) -> bytes:
         with self.state_lock:
@@ -660,6 +666,70 @@ class StreamPipeline:
             except queue.Empty:
                 return
 
+    def _next_buffered_pcm_frame(
+        self,
+        encoder_group: EncoderWorker,
+        pending: bytearray,
+    ) -> bytes | None:
+        target_bytes = self._pcm_buffer_target_bytes()
+        if not encoder_group.pcm_buffer_ready:
+            required = max(PCM_FRAME_BYTES, target_bytes)
+            if len(pending) < required:
+                return None
+            encoder_group.pcm_buffer_ready = True
+            LOG.debug(
+                "PCM buffer ready for encoder group %s with %.2f seconds buffered",
+                encoder_group.key,
+                len(pending) / 2 / IQ_SAMPLE_RATE,
+            )
+        low_water_bytes = self._pcm_buffer_low_water_bytes(target_bytes)
+        if low_water_bytes and len(pending) <= low_water_bytes:
+            encoder_group.pcm_buffer_ready = False
+            LOG.debug(
+                "PCM buffer low for encoder group %s with %.2f seconds remaining; refilling",
+                encoder_group.key,
+                len(pending) / 2 / IQ_SAMPLE_RATE,
+            )
+            return None
+        if len(pending) < PCM_FRAME_BYTES:
+            encoder_group.pcm_buffer_ready = False
+            return None
+        frame = bytes(pending[:PCM_FRAME_BYTES])
+        del pending[:PCM_FRAME_BYTES]
+        return frame
+
+    def _apply_pcm_buffer_target(
+        self,
+        encoder_group: EncoderWorker,
+        pending: bytearray,
+    ) -> None:
+        target_bytes = self._pcm_buffer_target_bytes()
+        previous_target = encoder_group.pcm_buffer_target_bytes
+        encoder_group.pcm_buffer_target_bytes = target_bytes
+        if target_bytes > previous_target and len(pending) < target_bytes:
+            encoder_group.pcm_buffer_ready = False
+        if (
+            target_bytes < previous_target
+            and len(pending) > max(target_bytes, PCM_FRAME_BYTES)
+        ):
+            keep_bytes = max(target_bytes, PCM_FRAME_BYTES)
+            del pending[: len(pending) - keep_bytes]
+
+    def _pcm_buffer_target_bytes(self) -> int:
+        with self.state_lock:
+            buffer_seconds = self.csdr_server.buffer_seconds
+        frame_count = round(buffer_seconds / SILENCE_FRAME_SECONDS)
+        return max(0, frame_count * PCM_FRAME_BYTES)
+
+    def _pcm_buffer_low_water_bytes(self, target_bytes: int) -> int:
+        if target_bytes <= PCM_FRAME_BYTES:
+            return 0
+        low_water_frames = max(
+            1,
+            round(target_bytes * PCM_BUFFER_LOW_WATER_RATIO / PCM_FRAME_BYTES),
+        )
+        return low_water_frames * PCM_FRAME_BYTES
+
     def _sleep_until_reconnect(self) -> None:
         deadline = time.monotonic() + RECONNECT_DELAY_SECONDS
         while not self.stop_event.is_set() and time.monotonic() < deadline:
@@ -721,6 +791,14 @@ def _station_from_frequency_hz(frequency_hz: int) -> StationConfig:
 
 def _encoder_key(config: IcecastConfig) -> tuple[str, int, int]:
     return config.format, config.sample_rate, config.bitrate
+
+
+def _csdr_connection_changed(new: CsdrServerConfig, current: CsdrServerConfig) -> bool:
+    return (
+        new.host != current.host
+        or new.port != current.port
+        or new.iq_format != current.iq_format
+    )
 
 
 def _icecast_label(config: IcecastConfig) -> str:

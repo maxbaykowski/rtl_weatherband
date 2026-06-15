@@ -14,8 +14,10 @@ from rtl_weatherband.config import (
     IcecastConfig,
     StationConfig,
 )
+from rtl_weatherband.csdr_server import IqStream
 from rtl_weatherband.fallback_audio import FallbackAudio
 from rtl_weatherband.pipeline import (
+    PCM_FRAME_BYTES,
     SILENCE_FRAME,
     EncoderWorker,
     FallbackPlaybackState,
@@ -52,6 +54,16 @@ class FakeEncoder:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakeIqSocket:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def recv(self, count: int, flags: int = 0) -> bytes:
+        payload = self.payload[:count]
+        self.payload = self.payload[count:]
+        return payload
 
 
 class PipelineTests(unittest.TestCase):
@@ -278,7 +290,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(frame, b"\x01\x00" * 320)
         self.assertTrue(encoder_group.fallback_state.active)
 
-    def test_real_pcm_resets_fallback_state(self) -> None:
+    def test_queued_pcm_does_not_reset_fallback_state(self) -> None:
         pipeline = self.make_pipeline()
         encoder_group = EncoderWorker(
             key=("mp3", 16000, 32),
@@ -293,8 +305,141 @@ class PipelineTests(unittest.TestCase):
 
         pipeline._queue_pcm(b"\x02\x00" * 320)
 
-        self.assertFalse(encoder_group.fallback_state.active)
+        self.assertTrue(encoder_group.fallback_state.active)
         self.assertEqual(encoder_group.pcm_queue.get_nowait(), b"\x02\x00" * 320)
+
+    def test_output_pcm_resets_fallback_state(self) -> None:
+        pipeline = self.make_pipeline()
+        encoder_group = EncoderWorker(
+            key=("mp3", 16000, 32),
+            config=pipeline.icecast[0],
+            encoder=FakeEncoder(),
+            pcm_queue=queue.Queue(),
+            stop_event=threading.Event(),
+            thread=threading.Thread(),
+        )
+        encoder_group.fallback_state.active = True
+        pipeline.encoder_groups.append(encoder_group)
+
+        pipeline._mark_pcm_output()
+
+        self.assertFalse(encoder_group.fallback_state.active)
+
+    def test_pcm_buffer_outputs_silence_until_target_is_filled(self) -> None:
+        pipeline = self.make_pipeline()
+        pipeline.csdr_server = CsdrServerConfig(
+            host="127.0.0.1",
+            port=4951,
+            buffer_seconds=0.04,
+        )
+        encoder_group = EncoderWorker(
+            key=("mp3", 16000, 32),
+            config=pipeline.icecast[0],
+            encoder=FakeEncoder(),
+            pcm_queue=queue.Queue(),
+            stop_event=threading.Event(),
+            thread=threading.Thread(),
+        )
+        pending = bytearray(b"\x01\x00" * 320)
+
+        pipeline._apply_pcm_buffer_target(encoder_group, pending)
+        frame = pipeline._next_buffered_pcm_frame(encoder_group, pending)
+
+        self.assertIsNone(frame)
+        pending.extend(b"\x02\x00" * 320)
+        frame = pipeline._next_buffered_pcm_frame(encoder_group, pending)
+
+        self.assertEqual(frame, b"\x01\x00" * 320)
+        self.assertTrue(encoder_group.pcm_buffer_ready)
+
+    def test_lower_pcm_buffer_target_skips_old_audio(self) -> None:
+        pipeline = self.make_pipeline()
+        pipeline.csdr_server = CsdrServerConfig(
+            host="127.0.0.1",
+            port=4951,
+            buffer_seconds=0.02,
+        )
+        encoder_group = EncoderWorker(
+            key=("mp3", 16000, 32),
+            config=pipeline.icecast[0],
+            encoder=FakeEncoder(),
+            pcm_queue=queue.Queue(),
+            stop_event=threading.Event(),
+            thread=threading.Thread(),
+            pcm_buffer_target_bytes=PCM_FRAME_BYTES * 3,
+            pcm_buffer_ready=True,
+        )
+        pending = bytearray(
+            b"\x01\x00" * 320
+            + b"\x02\x00" * 320
+            + b"\x03\x00" * 320
+        )
+
+        pipeline._apply_pcm_buffer_target(encoder_group, pending)
+        frame = pipeline._next_buffered_pcm_frame(encoder_group, pending)
+
+        self.assertEqual(frame, b"\x03\x00" * 320)
+
+    def test_pcm_buffer_refills_when_it_reaches_low_water_mark(self) -> None:
+        pipeline = self.make_pipeline()
+        pipeline.csdr_server = CsdrServerConfig(
+            host="127.0.0.1",
+            port=4951,
+            buffer_seconds=0.08,
+        )
+        encoder_group = EncoderWorker(
+            key=("mp3", 16000, 32),
+            config=pipeline.icecast[0],
+            encoder=FakeEncoder(),
+            pcm_queue=queue.Queue(),
+            stop_event=threading.Event(),
+            thread=threading.Thread(),
+            pcm_buffer_target_bytes=PCM_FRAME_BYTES * 4,
+            pcm_buffer_ready=True,
+        )
+        pending = bytearray(b"\x01\x00" * 320)
+
+        frame = pipeline._next_buffered_pcm_frame(encoder_group, pending)
+
+        self.assertIsNone(frame)
+        self.assertFalse(encoder_group.pcm_buffer_ready)
+        self.assertEqual(pending, b"\x01\x00" * 320)
+
+        pending.extend(b"\x02\x00" * 320 * 3)
+        frame = pipeline._next_buffered_pcm_frame(encoder_group, pending)
+
+        self.assertEqual(frame, b"\x01\x00" * 320)
+        self.assertTrue(encoder_group.pcm_buffer_ready)
+
+    def test_buffer_only_reload_does_not_queue_csdr_hotswap(self) -> None:
+        pipeline = self.make_pipeline()
+        new_config = AppConfig(
+            csdr_server=CsdrServerConfig(
+                host="127.0.0.1",
+                port=4951,
+                buffer_seconds=5,
+            ),
+            station=StationConfig(frequency=pipeline.frequency_hz / 1_000_000),
+            icecast=pipeline.icecast,
+            audio=pipeline.audio,
+            fallback=FallbackConfig(silence_timeout_seconds=30),
+        )
+
+        applied = pipeline.apply_runtime_config(new_config)
+
+        self.assertEqual(applied.csdr_server.buffer_seconds, 5)
+        self.assertEqual(pipeline.csdr_server.buffer_seconds, 5)
+        self.assertIsNone(pipeline.pending_receiver)
+
+    def test_hotswap_probe_reads_only_available_iq_chunk(self) -> None:
+        pipeline = self.make_pipeline()
+        iq_socket = FakeIqSocket(b"\x00" * 16)
+        iq_stream = IqStream(iq_socket, FakeIqSocket(b""), {}, "s16")
+
+        with patch("rtl_weatherband.pipeline.select.select", return_value=([iq_socket], [], [])):
+            chunk = pipeline._read_hotswap_iq_probe(iq_stream, 0.1)
+
+        self.assertEqual(chunk, b"\x00" * 16)
 
     def test_fallback_config_reload_does_not_reset_idle_timer(self) -> None:
         pipeline = self.make_pipeline()

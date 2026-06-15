@@ -7,6 +7,13 @@
     // Timeout, in seconds, before attempting to reconnect after connection drops.
     timeout: 10,
     /*
+    Audio buffer size in seconds. Use a low value for localhost.
+    For remote csdr_server connections, 5-10 seconds can smooth over short network dropouts.
+    If the buffer gets low, rtl_weatherband will briefly send silence while it refills.
+    This must be lower than fallback.silence_timeout_seconds.
+    */
+    buffer_seconds: 1,
+    /*
     IQ sample format requested from csdr_server.
     "f32" is the default and keeps the most precision.
     "s16" uses about half the network bandwidth; rtl_weatherband converts it back to float internally for DSP.

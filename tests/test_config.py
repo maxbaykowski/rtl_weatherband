@@ -51,6 +51,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.station.frequency_hz, 162_550_000)
         self.assertEqual(config.csdr_server.control_port, 4952)
         self.assertEqual(config.csdr_server.iq_format, "f32")
+        self.assertEqual(config.csdr_server.buffer_seconds, 1.0)
         self.assertEqual(len(config.icecast), 1)
         self.assertEqual(config.icecast[0].mount, "/nwr.mp3")
         self.assertEqual(config.icecast[0].content_type, "audio/mpeg")
@@ -72,6 +73,24 @@ class ConfigTests(unittest.TestCase):
         raw = valid_config()
         raw["csdr_server"]["iq_format"] = "u8"
         with self.assertRaisesRegex(ConfigError, "f32.*s16"):
+            parse_config(raw)
+
+    def test_accepts_csdr_server_buffer_seconds(self) -> None:
+        raw = valid_config()
+        raw["csdr_server"]["buffer_seconds"] = 10
+        raw["fallback"] = {
+            "silence_timeout_seconds": 30,
+        }
+        config = parse_config(raw)
+        self.assertEqual(config.csdr_server.buffer_seconds, 10.0)
+
+    def test_rejects_buffer_that_is_not_less_than_fallback_timeout(self) -> None:
+        raw = valid_config()
+        raw["csdr_server"]["buffer_seconds"] = 30
+        raw["fallback"] = {
+            "silence_timeout_seconds": 30,
+        }
+        with self.assertRaisesRegex(ConfigError, "buffer_seconds.*less than"):
             parse_config(raw)
 
     def test_accepts_valid_custom_fallback_audio(self) -> None:
@@ -353,6 +372,19 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.fallback, current.fallback)
         self.assertTrue(any("fallback:" in error for error in errors))
+
+    def test_reload_keeps_old_buffer_when_new_buffer_exceeds_fallback(self) -> None:
+        current = parse_config(valid_config())
+        raw = valid_config()
+        raw["csdr_server"]["buffer_seconds"] = 30
+        raw["fallback"] = {
+            "silence_timeout_seconds": 30,
+        }
+
+        config, errors = merge_valid_reload_config(raw, current)
+
+        self.assertEqual(config.csdr_server, current.csdr_server)
+        self.assertTrue(any("buffer_seconds" in error for error in errors))
 
     def test_reload_keeps_changed_notch_when_it_crosses_highpass(self) -> None:
         current_raw = valid_config()

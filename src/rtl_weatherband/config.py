@@ -52,6 +52,7 @@ class CsdrServerConfig:
     port: int
     timeout: float = 10.0
     iq_format: str = "f32"
+    buffer_seconds: float = 1.0
 
     @property
     def control_port(self) -> int:
@@ -214,6 +215,15 @@ def merge_valid_reload_config(
         errors.append(f"fallback: {exc}")
         fallback = current.fallback
 
+    try:
+        validate_buffer_config(csdr_server, fallback)
+    except ConfigError as exc:
+        errors.append(str(exc))
+        if csdr_server != current.csdr_server:
+            csdr_server = current.csdr_server
+        if fallback != current.fallback:
+            fallback = current.fallback
+
     return AppConfig(
         csdr_server=csdr_server,
         station=station,
@@ -229,6 +239,7 @@ def parse_csdr_server_config(raw: dict[str, Any]) -> CsdrServerConfig:
         port=_int(raw, "port"),
         timeout=float(raw.get("timeout", 10.0)),
         iq_format=_str(raw, "iq_format", "f32").lower(),
+        buffer_seconds=float(raw.get("buffer_seconds", 1.0)),
     )
 
 
@@ -417,6 +428,7 @@ def validate_config(config: AppConfig) -> None:
     validate_icecast_configs(config.icecast)
     validate_audio_config(config.audio)
     validate_fallback_config(config.fallback)
+    validate_buffer_config(config.csdr_server, config.fallback)
 
 
 def validate_station_config(config: StationConfig) -> None:
@@ -432,6 +444,10 @@ def validate_csdr_server_config(config: CsdrServerConfig) -> None:
         raise ConfigError("csdr_server.port must be from 1 through 65534")
     if config.iq_format not in {"f32", "s16"}:
         raise ConfigError("csdr_server.iq_format must be either 'f32' or 's16'")
+    if not _finite(config.buffer_seconds) or config.buffer_seconds < 0:
+        raise ConfigError(
+            "csdr_server.buffer_seconds must be a finite number greater than or equal to 0"
+        )
 
 
 def validate_icecast_config(config: IcecastConfig) -> None:
@@ -519,6 +535,17 @@ def validate_fallback_config(config: FallbackConfig) -> None:
             "fallback.loop_delay_seconds must be a finite number greater than or equal to 0"
         )
     load_fallback_audio(config.path)
+
+
+def validate_buffer_config(
+    csdr_server: CsdrServerConfig,
+    fallback: FallbackConfig,
+) -> None:
+    if csdr_server.buffer_seconds >= fallback.silence_timeout_seconds:
+        raise ConfigError(
+            "csdr_server.buffer_seconds must be less than "
+            "fallback.silence_timeout_seconds"
+        )
 
 
 def _audio_filter_relationship_errors(config: AudioConfig) -> list[str]:
