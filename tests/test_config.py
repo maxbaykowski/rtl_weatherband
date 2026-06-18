@@ -75,6 +75,12 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "f32.*s16"):
             parse_config(raw)
 
+    def test_rejects_invalid_csdr_server_timeout(self) -> None:
+        raw = valid_config()
+        raw["csdr_server"]["timeout"] = 0
+        with self.assertRaisesRegex(ConfigError, "timeout"):
+            parse_config(raw)
+
     def test_accepts_csdr_server_buffer_seconds(self) -> None:
         raw = valid_config()
         raw["csdr_server"]["buffer_seconds"] = 10
@@ -284,6 +290,12 @@ class ConfigTests(unittest.TestCase):
         raw = valid_config()
         raw["icecast"]["sample_rate"] = 12345
         with self.assertRaisesRegex(ConfigError, "invalid sample rate"):
+            parse_config(raw)
+
+    def test_rejects_string_icecast_booleans(self) -> None:
+        raw = valid_config()
+        raw["icecast"]["tls"] = "false"
+        with self.assertRaisesRegex(ConfigError, "tls"):
             parse_config(raw)
 
     def test_rejects_mp3_bitrate_above_low_sample_rate_limit(self) -> None:

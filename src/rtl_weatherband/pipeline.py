@@ -513,7 +513,8 @@ class StreamPipeline:
         if not readable:
             iq_stream.close()
             raise TimeoutError("replacement IQ stream did not produce data")
-        chunk = iq_stream.stream_socket.recv(65536)
+        bytes_per_iq_sample = 8 if iq_stream.iq_format == "f32" else 4
+        chunk = iq_stream.stream_socket.recv(bytes_per_iq_sample)
         if not chunk:
             iq_stream.close()
             raise ConnectionError("replacement IQ stream socket closed")

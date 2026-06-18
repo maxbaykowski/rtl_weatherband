@@ -257,11 +257,11 @@ def parse_icecast_config(raw: dict[str, Any]) -> IcecastConfig:
         format=_str(raw, "format").lower(),
         sample_rate=_int(raw, "sample_rate"),
         bitrate=_int(raw, "bitrate"),
-        tls=bool(raw.get("tls", False)),
+        tls=_bool(raw, "tls", False),
         name=_optional_str(raw, "name"),
         genre=_optional_str(raw, "genre"),
         description=_optional_str(raw, "description"),
-        public=bool(raw.get("public", False)),
+        public=_bool(raw, "public", False),
     )
 
 
@@ -442,6 +442,10 @@ def validate_station_config(config: StationConfig) -> None:
 def validate_csdr_server_config(config: CsdrServerConfig) -> None:
     if config.port <= 0 or config.port > 65534:
         raise ConfigError("csdr_server.port must be from 1 through 65534")
+    if not _finite(config.timeout) or config.timeout <= 0:
+        raise ConfigError(
+            "csdr_server.timeout must be a finite number greater than 0"
+        )
     if config.iq_format not in {"f32", "s16"}:
         raise ConfigError("csdr_server.iq_format must be either 'f32' or 's16'")
     if not _finite(config.buffer_seconds) or config.buffer_seconds < 0:

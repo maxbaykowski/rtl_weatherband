@@ -439,7 +439,8 @@ class PipelineTests(unittest.TestCase):
         with patch("rtl_weatherband.pipeline.select.select", return_value=([iq_socket], [], [])):
             chunk = pipeline._read_hotswap_iq_probe(iq_stream, 0.1)
 
-        self.assertEqual(chunk, b"\x00" * 16)
+        self.assertEqual(chunk, b"\x00" * 4)
+        self.assertEqual(iq_socket.payload, b"\x00" * 12)
 
     def test_fallback_config_reload_does_not_reset_idle_timer(self) -> None:
         pipeline = self.make_pipeline()
