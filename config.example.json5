@@ -8,9 +8,9 @@
     timeout: 10,
     /*
     Audio buffer size in seconds.
-    For connections to localhost set this to 1 second, for servers hosted over LAN or WAN use 5-10 seconds.
+    For connections to localhost set this to 0 seconds, for servers hosted over LAN or WAN use 1-2 seconds.
     */
-    buffer_seconds: 1,
+    buffer_seconds: 0,
     /*
     IQ sample format requested from csdr_server.
     "f32" is the default and may give slightly better results.
@@ -25,11 +25,11 @@ Keep as "f32" unless you're connecting to a csdr_server instance on LAN or WAN.
     frequency: 162.55,
   },
 
+  // Stream to one or more icecast mountpoints
   icecast: {
-    // Disable all Icecast destinations without deleting their settings.
+    // Enable or disable all icecast outputs
     enabled: true,
     // Define one or more Icecast destinations.
-    // single-object icecast config is still supported.
     destinations: [
       {
         // Enable or disable this output
@@ -46,34 +46,35 @@ Keep as "f32" unless you're connecting to a csdr_server instance on LAN or WAN.
         username: "source",
         // The password for authentication to the server.
         password: "hackme",
-        // Streaming format ("mp3" or "ogg").
+        // Encoding format ("mp3" or "ogg").
         format: "mp3",
-        // The sample rate for the stream. Valid values are 8000, 11025, 16000, 22050, 24000, 32000, 44100, and 48000.
+        // The audio sample rate to encode at for this icecast mountpoint. Valid values are 8000, 11025, 16000, 22050, 24000, 32000, 44100, and 48000.
         sample_rate: 16000,
-        // Encoder bitrate in Kbps.
+        // Encoder bitrate in Kbps for this icecast mountpoint.
         bitrate: 32,
-        // The stream name that will appear on the icecast status page.
+        // The stream name.
         name: "NOAA Weather Radio",
-        // The genre of the stream. This doesn't really matter for NOAA Weather Radio Streaming.
+        // The stream genre. This doesn't really matter for NOAA Weather Radio.
         genre: "Weather",
-        // The stream description that will appear on the icecast status page.
+        // The stream description.
         description: "NOAA Weather Radio via rtl_weatherband",
-        // Controls whether the stream is publically available for anyone that connects to the icecast server (you most likely want this enabled).
+        // Controls whether the stream is public. You most likely want this enabled.
         public: true,
       },
       // Add more destinations here if you want to stream to multiple mounts or servers.
     ],
   },
 
+  // Output the stream to one or more sound cards on your device, great for connecting your machine up to an ENDEC without worrying about icecast instability.
   soundcard: {
-    // Enable/disable all local soundcard outputs
+    // Enable/disable all soundcard outputs
     enabled: true,
-    // Optionally output the stream to a sound card on your device, great for connecting your machine up to an ENDEC without worrying about icecast instability.
     outputs: [
       {
         // Enable or disable this output
         enabled: false,
         /*
+        The sound card to output to.
         Leave unset to use the system default output device.
         ALSA examples: "plughw:1", "plughw:1,0", "hw:1".
         Pulse/PipeWire examples: "pulse:61" or "pulse:alsa_output.example.sink".
@@ -81,15 +82,13 @@ Keep as "f32" unless you're connecting to a csdr_server instance on LAN or WAN.
         */
         // device: "plughw:1,0",
       },
-      // Add more local audio outputs here if needed.
+      // Add more sound card outputs here if needed.
     ],
   },
 
+  // Fallback audio will be played when the server goes down so listeners aren't hearing silence.
   fallback: {
-    /*
-Fallback audio will be played when the server goes down so listeners aren't hearing silence.
-    Valid range: 30 through 120 seconds.
-    */
+    // The time, in seconds, to wait before fallback audio starts playing. Valid range is 30 through 120 seconds.
     silence_timeout_seconds: 30,
     /*
     How long to wait after the fallback audio finishes before starting it again.
@@ -106,36 +105,44 @@ Fallback audio will be played when the server goes down so listeners aren't hear
   audio: {
     // NFM deemphasis filter for reducing high frequency content.
     deemphasis: {
+      // Enable or disable this effect
       enabled: true,
       /*
       Time constant in microseconds. Valid range: 0 through 530.
-      Please do not disable this filter, doing so will make NFM signals sound awful!
+The higher the time constant, the more aggressively the audio will be deemphasized.
+Most people should keep this at its default value.
       */
       tau: 300,
     },
     // Controls the stream volume.
     volume: {
+      // Enable or disable this effect
       enabled: false,
+      // The volume multiplier
       multiplier: 1.0,
     },
-    /*
-    gets rid of low-frequency audio, such as 60 Hz hums.
-    To protect the 1050 Hz attention tone, frequency cannot be set above 900 Hz.
-    */
+    // gets rid of low-frequency audio, such as 60 Hz hums.
     highpass: {
+      // Enable or disable this effect
       enabled: false,
+      /*
+      Frequency in Hz. Frequencies below this value will be attenuated.
+      To protect the 1050 Hz attention tone, frequency cannot be set above 900 Hz.
+      */
       frequency: 300,
       /* Filter sharpness (0-10).
       0 is more gentle, 10 will cut off frequencies much more aggressively.
       */
       sharpness: 2,
     },
-    /*
-    gets rid of high-frequency audio. Use it in conjunction with the NFM deemphasis filter.
-    To protect SAME tones, frequency cannot be set below 2200 Hz.
-    */
+    // gets rid of high-frequency audio. This is different from the NFM deemphasis filter.
     lowpass: {
+      // Enable or disable this effect
       enabled: true,
+      /*
+      Frequency in Hz. Frequencies above this value will be attenuated.
+      To protect SAME tones, frequency cannot be set below 2200 Hz.
+      */
       frequency: 3000,
       /* Filter sharpness (0-10).
       0 is more gentle, 10 will cut off frequencies much more aggressively.
@@ -143,9 +150,13 @@ Fallback audio will be played when the server goes down so listeners aren't hear
       sharpness: 2,
     },
     // Removes a narrow tone, useful for analog whines.
-    // To protect the 1050 Hz attention tone and the SAME tones, the frequency cannot be within protected bands 900-1100, 1400-1600, or 2000-2200 Hz.
     notch: {
+      // Enable or disable this effect
       enabled: false,
+      /*
+      Frequency in Hz. Frequencies of and near this value will be attenuated.
+      To protect the 1050 Hz attention tone and the SAME tones, the frequency cannot be within protected bands 900-1100, 1400-1600, or 2000-2200 Hz.
+      */
       frequency: 3000,
       /* Filter sharpness (0-10).
       0 is more gentle, 10 will cut off frequencies much more aggressively.
