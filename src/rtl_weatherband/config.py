@@ -78,6 +78,7 @@ class IcecastConfig:
     format: str
     sample_rate: int
     bitrate: int
+    enabled: bool = True
     tls: bool = False
     name: str | None = None
     genre: str | None = None
@@ -133,12 +134,19 @@ class FallbackConfig:
 
 
 @dataclass(frozen=True)
+class SoundcardConfig:
+    enabled: bool = False
+    device: str | int | None = None
+
+
+@dataclass(frozen=True)
 class AppConfig:
     csdr_server: CsdrServerConfig
     station: StationConfig
     icecast: tuple[IcecastConfig, ...]
     audio: AudioConfig
     fallback: FallbackConfig = field(default_factory=FallbackConfig)
+    soundcard: tuple[SoundcardConfig, ...] = field(default_factory=tuple)
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -162,6 +170,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
     icecast = raw.get("icecast")
     audio = _section(raw, "audio")
     fallback = raw.get("fallback")
+    soundcard = raw.get("soundcard")
 
     app = AppConfig(
         csdr_server=parse_csdr_server_config(csdr_server),
@@ -169,6 +178,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
         icecast=parse_icecast_configs(icecast),
         audio=parse_audio_config(audio),
         fallback=parse_fallback_config(fallback),
+        soundcard=parse_soundcard_config(soundcard),
     )
     validate_config(app)
     return app
@@ -224,12 +234,20 @@ def merge_valid_reload_config(
         if fallback != current.fallback:
             fallback = current.fallback
 
+    try:
+        soundcard = parse_soundcard_config(raw.get("soundcard"))
+        validate_soundcard_configs(soundcard)
+    except (ConfigError, KeyError, TypeError, ValueError) as exc:
+        errors.append(f"soundcard: {exc}")
+        soundcard = current.soundcard
+
     return AppConfig(
         csdr_server=csdr_server,
         station=station,
         icecast=icecast,
         audio=audio,
         fallback=fallback,
+        soundcard=soundcard,
     ), errors
 
 
@@ -257,6 +275,7 @@ def parse_icecast_config(raw: dict[str, Any]) -> IcecastConfig:
         format=_str(raw, "format").lower(),
         sample_rate=_int(raw, "sample_rate"),
         bitrate=_int(raw, "bitrate"),
+        enabled=_bool(raw, "enabled", True),
         tls=_bool(raw, "tls", False),
         name=_optional_str(raw, "name"),
         genre=_optional_str(raw, "genre"),
@@ -269,6 +288,8 @@ def parse_icecast_configs(raw: Any) -> tuple[IcecastConfig, ...]:
     if isinstance(raw, list):
         configs = tuple(parse_icecast_config(_object(value, "icecast")) for value in raw)
     elif isinstance(raw, dict) and "destinations" in raw:
+        if not _bool(raw, "enabled", True):
+            return ()
         destinations = raw["destinations"]
         if not isinstance(destinations, list):
             raise ConfigError("icecast.destinations must be an array")
@@ -280,9 +301,7 @@ def parse_icecast_configs(raw: Any) -> tuple[IcecastConfig, ...]:
         configs = (parse_icecast_config(raw),)
     else:
         raise ConfigError("icecast must be an object or array")
-    if not configs:
-        raise ConfigError("icecast must define at least one destination")
-    return configs
+    return tuple(config for config in configs if config.enabled)
 
 
 def parse_audio_config(raw: dict[str, Any]) -> AudioConfig:
@@ -422,12 +441,45 @@ def parse_fallback_config(raw: Any) -> FallbackConfig:
     )
 
 
+def parse_soundcard_config(raw: Any) -> tuple[SoundcardConfig, ...]:
+    if raw is None:
+        return ()
+    raw = _object(raw, "soundcard")
+    section_enabled = _bool(raw, "enabled", True)
+    if not section_enabled:
+        return ()
+    if "outputs" in raw:
+        outputs = raw["outputs"]
+        if not isinstance(outputs, list):
+            raise ConfigError("soundcard.outputs must be an array")
+        configs = tuple(
+            parse_soundcard_output_config(_object(value, "soundcard output"))
+            for value in outputs
+        )
+        return tuple(config for config in configs if config.enabled)
+    config = parse_soundcard_output_config(raw)
+    return (config,) if config.enabled else ()
+
+
+def parse_soundcard_output_config(raw: dict[str, Any]) -> SoundcardConfig:
+    device = raw.get("device")
+    if device is not None and not isinstance(device, str | int):
+        raise ConfigError("soundcard.device must be a string, integer, or null")
+    if isinstance(device, str) and not device:
+        raise ConfigError("soundcard.device must not be an empty string")
+    return SoundcardConfig(
+        enabled=_bool(raw, "enabled", False),
+        device=device,
+    )
+
+
 def validate_config(config: AppConfig) -> None:
     validate_station_config(config.station)
     validate_csdr_server_config(config.csdr_server)
     validate_icecast_configs(config.icecast)
     validate_audio_config(config.audio)
     validate_fallback_config(config.fallback)
+    validate_soundcard_configs(config.soundcard)
     validate_buffer_config(config.csdr_server, config.fallback)
 
 
@@ -465,8 +517,6 @@ def validate_icecast_config(config: IcecastConfig) -> None:
 
 
 def validate_icecast_configs(configs: tuple[IcecastConfig, ...]) -> None:
-    if not configs:
-        raise ConfigError("icecast must define at least one destination")
     errors: list[str] = []
     for index, config in enumerate(configs):
         try:
@@ -539,6 +589,22 @@ def validate_fallback_config(config: FallbackConfig) -> None:
             "fallback.loop_delay_seconds must be a finite number greater than or equal to 0"
         )
     load_fallback_audio(config.path)
+
+
+def validate_soundcard_config(config: SoundcardConfig) -> None:
+    if isinstance(config.device, bool):
+        raise ConfigError("soundcard.device must be a string, integer, or null")
+
+
+def validate_soundcard_configs(configs: tuple[SoundcardConfig, ...]) -> None:
+    errors: list[str] = []
+    for index, config in enumerate(configs):
+        try:
+            validate_soundcard_config(config)
+        except ConfigError as exc:
+            errors.append(f"soundcard output {index}: {exc}")
+    if errors:
+        raise ConfigError("; ".join(errors))
 
 
 def validate_buffer_config(

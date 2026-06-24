@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
+import numpy as np
+
 from .config import (
     AppConfig,
     AudioConfig,
@@ -16,6 +18,7 @@ from .config import (
     FallbackConfig,
     IcecastConfig,
     IQ_SAMPLE_RATE,
+    SoundcardConfig,
     StationConfig,
 )
 from .csdr_server import CsdrServerError, IqStream, open_iq_stream
@@ -23,6 +26,12 @@ from .audio_effects import AudioEffectsProcessor
 from .encoder import AudioEncoder, PcmResampler, create_audio_encoder
 from .fallback_audio import FallbackAudio, load_fallback_audio
 from .nfm import NfmDemodulator, float_to_s16
+from .soundcard import (
+    SoundcardDependencyError,
+    SoundcardError,
+    SoundcardFatalError,
+    SoundcardOutput,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -36,6 +45,7 @@ SILENCE_FRAME_SECONDS = 0.02
 SILENCE_FRAME_SAMPLES = round(IQ_SAMPLE_RATE * SILENCE_FRAME_SECONDS)
 SILENCE_FRAME = b"\x00\x00" * SILENCE_FRAME_SAMPLES
 PCM_FRAME_BYTES = len(SILENCE_FRAME)
+AUDIO_FRAME_BYTES = SILENCE_FRAME_SAMPLES * np.dtype("<f4").itemsize
 PCM_QUEUE_CHUNKS = 100
 RECONNECT_DELAY_SECONDS = 5
 PCM_BUFFER_LOW_WATER_RATIO = 0.25
@@ -67,9 +77,14 @@ class EncoderWorker:
     thread: threading.Thread
     outputs: list[OutputWorker] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
-    fallback_state: FallbackPlaybackState = field(default_factory=lambda: FallbackPlaybackState())
-    pcm_buffer_ready: bool = False
-    pcm_buffer_target_bytes: int = 0
+    error: BaseException | None = None
+
+
+@dataclass
+class SoundcardWorker:
+    config: SoundcardConfig
+    output: SoundcardOutput
+    key: str = "soundcard"
     error: BaseException | None = None
 
 
@@ -92,17 +107,25 @@ class StreamPipeline:
     csdr_server: CsdrServerConfig
     frequency_hz: int
     fallback: FallbackConfig = field(default_factory=FallbackConfig)
+    soundcard: tuple[SoundcardConfig, ...] = field(default_factory=tuple)
     outputs: list[OutputWorker] = field(default_factory=list)
     encoder_groups: list[EncoderWorker] = field(default_factory=list)
+    soundcard_workers: list[SoundcardWorker] = field(default_factory=list)
+    pcm_queue: queue.Queue[bytes] = field(default_factory=lambda: queue.Queue(maxsize=PCM_QUEUE_CHUNKS))
+    playback_thread: threading.Thread | None = None
     producer_thread: threading.Thread | None = None
     stream_error: BaseException | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     state_lock: threading.Lock = field(default_factory=threading.Lock)
+    soundcard_lock: threading.Lock = field(default_factory=threading.Lock)
     active_iq_stream: IqStream | None = None
     pending_receiver: tuple[CsdrServerConfig, int] | None = None
     hotswap_thread: threading.Thread | None = None
     hotswap_result: tuple[tuple[CsdrServerConfig, int], IqStream, bytes] | None = None
     fallback_audio: FallbackAudio = field(init=False)
+    fallback_state: FallbackPlaybackState = field(default_factory=FallbackPlaybackState)
+    pcm_buffer_ready: bool = False
+    pcm_buffer_target_bytes: int = 0
     last_pcm_at: float = field(default_factory=time.monotonic)
 
     def __post_init__(self) -> None:
@@ -116,15 +139,29 @@ class StreamPipeline:
             name="numpy-nfm-producer",
             daemon=True,
         )
+        self.playback_thread = threading.Thread(
+            target=self._run_pcm_playback_worker,
+            name="pcm-playback",
+            daemon=True,
+        )
         self.outputs = []
         self.encoder_groups = []
+        self.soundcard_workers = []
+        self.fallback_state.reset()
+        self.pcm_buffer_ready = False
+        self.pcm_buffer_target_bytes = 0
         for destination, encoded_output in zip(
             self.icecast, encoded_outputs, strict=True
         ):
             self.outputs.append(
                 self._create_output_worker(destination, encoded_output)
             )
+        self.soundcard_workers = self._create_soundcard_workers(
+            self.soundcard,
+            tolerate_output_failures=True,
+        )
         self.producer_thread.start()
+        self.playback_thread.start()
         for encoder_group in self.encoder_groups:
             encoder_group.thread.start()
         for output in self.outputs:
@@ -140,6 +177,11 @@ class StreamPipeline:
             time.sleep(0.25)
 
     def poll_exit(self) -> ProcessExit | None:
+        if self.playback_thread is not None and not self.playback_thread.is_alive():
+            return ProcessExit(
+                stage="PCM playback",
+                returncode=1,
+            )
         for index, encoder_group in enumerate(self.encoder_groups):
             if not encoder_group.thread.is_alive():
                 return ProcessExit(
@@ -152,6 +194,9 @@ class StreamPipeline:
                     stage=f"encoded audio writer {index}",
                     returncode=1 if output.error is not None else 0,
                 )
+        for index, soundcard_worker in enumerate(self.soundcard_workers):
+            if soundcard_worker.error is not None:
+                return ProcessExit(stage=f"soundcard output {index}", returncode=1)
         return None
 
     def stop(self) -> None:
@@ -166,14 +211,20 @@ class StreamPipeline:
         if hotswap_result is not None:
             _, iq_stream, _ = hotswap_result
             iq_stream.close()
-        if self.producer_thread is not None:
+        if self.producer_thread is not None and self.producer_thread.ident is not None:
             self.producer_thread.join(timeout=2)
+        if self.playback_thread is not None and self.playback_thread.ident is not None:
+            self.playback_thread.join(timeout=2)
         for output in list(self.outputs):
             self._stop_output_worker(output)
         self.outputs = []
         for encoder_group in list(self.encoder_groups):
             self._stop_encoder_worker(encoder_group)
         self.encoder_groups = []
+        for soundcard_worker in list(self.soundcard_workers):
+            self._stop_soundcard_worker(soundcard_worker)
+        self.soundcard_workers = []
+        self._clear_pcm_queue(self.pcm_queue)
 
     def apply_icecast_outputs(
         self,
@@ -300,6 +351,64 @@ class StreamPipeline:
                 LOG.debug("encoder group %s has no outputs; stopping", encoder_group.key)
                 self._stop_encoder_worker(encoder_group)
 
+    def _create_soundcard_worker(self, config: SoundcardConfig) -> SoundcardWorker:
+        return SoundcardWorker(
+            config=config,
+            output=SoundcardOutput(config),
+        )
+
+    def _create_soundcard_workers(
+        self,
+        configs: tuple[SoundcardConfig, ...],
+        *,
+        tolerate_output_failures: bool,
+    ) -> list[SoundcardWorker]:
+        workers: list[SoundcardWorker] = []
+        for config in configs:
+            try:
+                workers.append(self._create_soundcard_worker(config))
+            except SoundcardDependencyError:
+                self._stop_soundcard_workers(workers)
+                raise
+            except SoundcardError as exc:
+                if not tolerate_output_failures:
+                    self._stop_soundcard_workers(workers)
+                    raise
+                LOG.warning(
+                    "soundcard output disabled after startup failure for %s: %s",
+                    _soundcard_label(config),
+                    exc,
+                )
+        try:
+            self._validate_unique_soundcard_workers(workers)
+        except Exception:
+            self._stop_soundcard_workers(workers)
+            raise
+        return workers
+
+    def _stop_soundcard_worker(self, worker: SoundcardWorker) -> None:
+        worker.output.close()
+        LOG.info("stopped soundcard output for %s", _soundcard_label(worker.config))
+
+    def _stop_soundcard_workers(self, workers: list[SoundcardWorker]) -> None:
+        for worker in list(workers):
+            self._stop_soundcard_worker(worker)
+
+    def _validate_unique_soundcard_workers(
+        self,
+        workers: list[SoundcardWorker],
+    ) -> None:
+        seen: dict[object, SoundcardWorker] = {}
+        for worker in workers:
+            key = getattr(worker.output, "device", worker.config.device)
+            if key in seen:
+                raise SoundcardFatalError(
+                    "multiple soundcard outputs resolved to the same device: "
+                    f"{_soundcard_label(seen[key].config)} and "
+                    f"{_soundcard_label(worker.config)}"
+                )
+            seen[key] = worker
+
     def apply_runtime_config(self, config: AppConfig) -> AppConfig:
         applied = config
         with self.state_lock:
@@ -308,6 +417,8 @@ class StreamPipeline:
                 self.fallback = config.fallback
                 self.fallback_audio = _load_pipeline_fallback_audio(self.fallback)
                 LOG.info("updated fallback audio settings")
+            old_soundcard = self.soundcard
+            soundcard_changed = config.soundcard != self.soundcard
             server_changed = _csdr_connection_changed(config.csdr_server, self.csdr_server)
             frequency_changed = config.station.frequency_hz != self.frequency_hz
             if server_changed:
@@ -319,20 +430,39 @@ class StreamPipeline:
                     self.csdr_server.host,
                     self.csdr_server.port,
                 )
-                return config
-            self.csdr_server = config.csdr_server
-            if self.pending_receiver is not None:
+                stream = None
+                timeout = 0
+                frequency_hz = self.frequency_hz
+            elif self.pending_receiver is not None:
+                self.csdr_server = config.csdr_server
                 self.frequency_hz = config.station.frequency_hz
                 self.pending_receiver = (self.csdr_server, self.frequency_hz)
-                return config
-            if frequency_changed:
+                stream = None
+                timeout = 0
+                frequency_hz = self.frequency_hz
+            elif frequency_changed:
+                self.csdr_server = config.csdr_server
                 stream = self.active_iq_stream
                 timeout = self.csdr_server.timeout
                 frequency_hz = config.station.frequency_hz
             else:
+                self.csdr_server = config.csdr_server
                 stream = None
                 timeout = 0
                 frequency_hz = self.frequency_hz
+
+        if soundcard_changed:
+            if not self._apply_soundcard_config(config.soundcard):
+                applied = AppConfig(
+                    csdr_server=config.csdr_server,
+                    station=config.station,
+                    icecast=config.icecast,
+                    audio=config.audio,
+                    fallback=config.fallback,
+                    soundcard=old_soundcard,
+                )
+                with self.state_lock:
+                    self.soundcard = old_soundcard
 
         if stream is not None:
             if self._retune_stream(stream, frequency_hz, timeout):
@@ -346,11 +476,56 @@ class StreamPipeline:
                     icecast=config.icecast,
                     audio=config.audio,
                     fallback=config.fallback,
+                    soundcard=applied.soundcard,
                 )
         else:
             with self.state_lock:
                 self.frequency_hz = frequency_hz
         return applied
+
+    def _apply_soundcard_config(self, config: tuple[SoundcardConfig, ...]) -> bool:
+        with self.soundcard_lock:
+            current_workers = list(self.soundcard_workers)
+        kept_workers: list[SoundcardWorker] = []
+        removed_workers: list[SoundcardWorker] = []
+        add_configs: list[SoundcardConfig] = []
+        remaining_workers = list(current_workers)
+        for soundcard_config in config:
+            match = next(
+                (
+                    worker
+                    for worker in remaining_workers
+                    if worker.config == soundcard_config
+                ),
+                None,
+            )
+            if match is None:
+                add_configs.append(soundcard_config)
+                continue
+            kept_workers.append(match)
+            remaining_workers.remove(match)
+        removed_workers = [
+            worker for worker in current_workers if worker not in kept_workers
+        ]
+
+        new_workers: list[SoundcardWorker] = []
+        try:
+            for soundcard_config in add_configs:
+                new_workers.append(self._create_soundcard_worker(soundcard_config))
+            self._validate_unique_soundcard_workers(kept_workers + new_workers)
+        except Exception as exc:
+            self._stop_soundcard_workers(new_workers)
+            LOG.warning("soundcard config reload failed; keeping existing output: %s", exc)
+            return False
+        final_workers = kept_workers + new_workers
+        with self.soundcard_lock:
+            self.soundcard_workers = final_workers
+        self._stop_soundcard_workers(removed_workers)
+        with self.state_lock:
+            self.soundcard = config
+        if add_configs or removed_workers:
+            LOG.info("updated soundcard output settings")
+        return True
 
     def _run_iq_producer(self) -> None:
         while not self.stop_event.is_set():
@@ -392,43 +567,32 @@ class StreamPipeline:
         if iq_stream is None:
             raise ConnectionError("IQ stream is not active")
         demodulator = NfmDemodulator(iq_stream.iq_format)
-        audio_config = self._audio_config()
-        effects = AudioEffectsProcessor(audio_config)
         while not self.stop_event.is_set():
             replacement = self._try_hotswap_iq_stream(iq_stream)
             if replacement is not None:
                 iq_stream, chunk = replacement
                 iq_socket = iq_stream.stream_socket
                 demodulator = NfmDemodulator(iq_stream.iq_format)
-                audio_config = self._audio_config()
-                effects = AudioEffectsProcessor(audio_config)
                 if chunk:
-                    self._process_iq_chunk(chunk, demodulator, effects)
+                    self._process_iq_chunk(chunk, demodulator)
                 continue
-            next_audio_config = self._audio_config()
-            if next_audio_config != audio_config:
-                audio_config = next_audio_config
-                effects = AudioEffectsProcessor(audio_config)
-                LOG.info("updated audio effects")
             readable, _, _ = select.select([iq_socket], [], [], 0.5)
             if not readable:
                 continue
             chunk = iq_socket.recv(65536)
             if not chunk:
                 raise ConnectionError("IQ stream socket closed")
-            self._process_iq_chunk(chunk, demodulator, effects)
+            self._process_iq_chunk(chunk, demodulator)
 
     def _process_iq_chunk(
         self,
         chunk: bytes,
         demodulator: NfmDemodulator,
-        effects: AudioEffectsProcessor,
     ) -> None:
         audio = demodulator.process(chunk)
         if len(audio) == 0:
             return
-        audio = effects.process(audio)
-        self._queue_pcm(float_to_s16(audio))
+        self._queue_audio(audio)
 
     def _try_hotswap_iq_stream(
         self,
@@ -524,32 +688,49 @@ class StreamPipeline:
         self,
         encoder_group: EncoderWorker,
     ) -> None:
-        pending = bytearray()
-        next_write_at = time.monotonic()
         try:
             while not self.stop_event.is_set() and not encoder_group.stop_event.is_set():
-                self._drain_pcm_queue(encoder_group.pcm_queue, pending)
-                self._apply_pcm_buffer_target(encoder_group, pending)
-                frame = self._next_buffered_pcm_frame(encoder_group, pending)
-                if frame is None:
-                    frame = self._idle_pcm_frame(encoder_group)
-                else:
-                    self._mark_pcm_output()
+                try:
+                    frame = encoder_group.pcm_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
                 encoded = encoder_group.encoder.encode(frame)
                 if encoded:
                     self._broadcast_encoded(encoder_group, encoded)
-
-                next_write_at += SILENCE_FRAME_SECONDS
-                delay = next_write_at - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
-                else:
-                    next_write_at = time.monotonic()
             encoded = encoder_group.encoder.flush()
             if encoded:
                 self._broadcast_encoded(encoder_group, encoded)
         except Exception as exc:
             encoder_group.error = exc
+
+    def _run_pcm_playback_worker(self) -> None:
+        pending = bytearray()
+        audio_config = self._audio_config()
+        effects = AudioEffectsProcessor(audio_config)
+        next_write_at = time.monotonic()
+        while not self.stop_event.is_set():
+            self._drain_pcm_queue(self.pcm_queue, pending)
+            self._apply_pcm_buffer_target(pending)
+            audio_frame = self._next_buffered_pcm_frame(pending)
+            if audio_frame is None:
+                pcm_frame = self._idle_pcm_frame()
+            else:
+                next_audio_config = self._audio_config()
+                if next_audio_config != audio_config:
+                    audio_config = next_audio_config
+                    effects = AudioEffectsProcessor(audio_config)
+                    LOG.info("updated audio effects")
+                audio = np.frombuffer(audio_frame, dtype="<f4")
+                pcm_frame = float_to_s16(effects.process(audio))
+                self._mark_pcm_output()
+            self._write_pcm_frame(pcm_frame)
+
+            next_write_at += SILENCE_FRAME_SECONDS
+            delay = next_write_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_write_at = time.monotonic()
 
     def _run_icecast_writer(
         self,
@@ -589,29 +770,39 @@ class StreamPipeline:
         for output in outputs:
             self._queue_encoded_for_output(output.encoded_queue, encoded)
 
-    def _queue_pcm(self, pcm: bytes) -> None:
+    def _queue_audio(self, audio: np.ndarray) -> None:
+        audio_frame = audio.astype("<f4", copy=False).tobytes()
+        self._queue_pcm_for_output(self.pcm_queue, audio_frame)
+
+    def _write_pcm_frame(self, pcm: bytes) -> None:
         for encoder_group in list(self.encoder_groups):
             self._queue_pcm_for_output(encoder_group.pcm_queue, pcm)
+        with self.soundcard_lock:
+            soundcard_workers = list(self.soundcard_workers)
+        for soundcard_worker in soundcard_workers:
+            try:
+                soundcard_worker.output.write(pcm)
+            except Exception as exc:
+                soundcard_worker.error = exc
 
     def _mark_pcm_output(self) -> None:
         with self.state_lock:
             self.last_pcm_at = time.monotonic()
-        self._reset_fallback_states()
+        self._reset_fallback_state()
 
-    def _idle_pcm_frame(self, encoder_group: EncoderWorker) -> bytes:
+    def _idle_pcm_frame(self) -> bytes:
         with self.state_lock:
             idle_seconds = time.monotonic() - self.last_pcm_at
             fallback = self.fallback
             fallback_audio = self.fallback_audio
-        state = encoder_group.fallback_state
+        state = self.fallback_state
         if not state.active and idle_seconds < fallback.silence_timeout_seconds:
-            encoder_group.fallback_state.reset()
+            state.reset()
             return SILENCE_FRAME
         if not state.active:
             state.active = True
             LOG.info(
-                "starting fallback audio for encoder group %s after %.1f seconds without PCM",
-                encoder_group.key,
+                "starting fallback audio after %.1f seconds without PCM",
                 idle_seconds,
             )
         return _next_fallback_frame(
@@ -620,11 +811,10 @@ class StreamPipeline:
             fallback.loop_delay_seconds,
         )
 
-    def _reset_fallback_states(self) -> None:
-        for encoder_group in list(self.encoder_groups):
-            if encoder_group.fallback_state.active:
-                LOG.info("stopping fallback audio for encoder group %s", encoder_group.key)
-            encoder_group.fallback_state.reset()
+    def _reset_fallback_state(self) -> None:
+        if self.fallback_state.active:
+            LOG.info("stopping fallback audio")
+        self.fallback_state.reset()
 
     def _queue_encoded_for_output(
         self,
@@ -667,69 +857,66 @@ class StreamPipeline:
             except queue.Empty:
                 return
 
-    def _next_buffered_pcm_frame(
-        self,
-        encoder_group: EncoderWorker,
-        pending: bytearray,
-    ) -> bytes | None:
+    def _next_buffered_pcm_frame(self, pending: bytearray) -> bytes | None:
         target_bytes = self._pcm_buffer_target_bytes()
-        if not encoder_group.pcm_buffer_ready:
-            required = max(PCM_FRAME_BYTES, target_bytes)
+        if not self.pcm_buffer_ready:
+            required = max(AUDIO_FRAME_BYTES, target_bytes)
             if len(pending) < required:
                 return None
-            encoder_group.pcm_buffer_ready = True
+            self.pcm_buffer_ready = True
             LOG.debug(
-                "PCM buffer ready for encoder group %s with %.2f seconds buffered",
-                encoder_group.key,
-                len(pending) / 2 / IQ_SAMPLE_RATE,
+                "audio buffer ready with %.2f seconds buffered",
+                len(pending) / np.dtype("<f4").itemsize / IQ_SAMPLE_RATE,
             )
         low_water_bytes = self._pcm_buffer_low_water_bytes(target_bytes)
         if low_water_bytes and len(pending) <= low_water_bytes:
-            encoder_group.pcm_buffer_ready = False
+            self.pcm_buffer_ready = False
             LOG.debug(
-                "PCM buffer low for encoder group %s with %.2f seconds remaining; refilling",
-                encoder_group.key,
-                len(pending) / 2 / IQ_SAMPLE_RATE,
+                "audio buffer low with %.2f seconds remaining; refilling",
+                len(pending) / np.dtype("<f4").itemsize / IQ_SAMPLE_RATE,
             )
             return None
-        if len(pending) < PCM_FRAME_BYTES:
-            encoder_group.pcm_buffer_ready = False
+        if len(pending) < AUDIO_FRAME_BYTES:
+            self.pcm_buffer_ready = False
             return None
-        frame = bytes(pending[:PCM_FRAME_BYTES])
-        del pending[:PCM_FRAME_BYTES]
+        frame = bytes(pending[:AUDIO_FRAME_BYTES])
+        del pending[:AUDIO_FRAME_BYTES]
         return frame
 
-    def _apply_pcm_buffer_target(
-        self,
-        encoder_group: EncoderWorker,
-        pending: bytearray,
-    ) -> None:
+    def _apply_pcm_buffer_target(self, pending: bytearray) -> None:
         target_bytes = self._pcm_buffer_target_bytes()
-        previous_target = encoder_group.pcm_buffer_target_bytes
-        encoder_group.pcm_buffer_target_bytes = target_bytes
+        previous_target = self.pcm_buffer_target_bytes
+        self.pcm_buffer_target_bytes = target_bytes
         if target_bytes > previous_target and len(pending) < target_bytes:
-            encoder_group.pcm_buffer_ready = False
+            self.pcm_buffer_ready = False
         if (
             target_bytes < previous_target
-            and len(pending) > max(target_bytes, PCM_FRAME_BYTES)
+            and len(pending) > max(target_bytes, AUDIO_FRAME_BYTES)
         ):
-            keep_bytes = max(target_bytes, PCM_FRAME_BYTES)
+            keep_bytes = max(target_bytes, AUDIO_FRAME_BYTES)
             del pending[: len(pending) - keep_bytes]
 
     def _pcm_buffer_target_bytes(self) -> int:
         with self.state_lock:
             buffer_seconds = self.csdr_server.buffer_seconds
         frame_count = round(buffer_seconds / SILENCE_FRAME_SECONDS)
-        return max(0, frame_count * PCM_FRAME_BYTES)
+        return max(0, frame_count * AUDIO_FRAME_BYTES)
 
     def _pcm_buffer_low_water_bytes(self, target_bytes: int) -> int:
-        if target_bytes <= PCM_FRAME_BYTES:
+        if target_bytes <= AUDIO_FRAME_BYTES:
             return 0
         low_water_frames = max(
             1,
-            round(target_bytes * PCM_BUFFER_LOW_WATER_RATIO / PCM_FRAME_BYTES),
+            round(target_bytes * PCM_BUFFER_LOW_WATER_RATIO / AUDIO_FRAME_BYTES),
         )
-        return low_water_frames * PCM_FRAME_BYTES
+        return low_water_frames * AUDIO_FRAME_BYTES
+
+    def _clear_pcm_queue(self, pcm_queue: queue.Queue[bytes]) -> None:
+        while True:
+            try:
+                pcm_queue.get_nowait()
+            except queue.Empty:
+                return
 
     def _sleep_until_reconnect(self) -> None:
         deadline = time.monotonic() + RECONNECT_DELAY_SECONDS
@@ -807,6 +994,10 @@ def _icecast_label(config: IcecastConfig) -> str:
         f"{config.format}@{config.sample_rate}Hz/{config.bitrate}kbps "
         f"{config.username}@{config.host}:{config.port}{config.mount}"
     )
+
+
+def _soundcard_label(config: SoundcardConfig) -> str:
+    return str(config.device) if config.device is not None else "default device"
 
 
 def _load_pipeline_fallback_audio(config: FallbackConfig) -> FallbackAudio:

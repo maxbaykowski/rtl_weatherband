@@ -12,10 +12,13 @@ from rtl_weatherband.config import (
 )
 from rtl_weatherband.runner import (
     _apply_icecast_reload,
+    _connect_initial_icecast_outputs,
     _diff_icecast_destinations,
     _icecast_reload_plan,
     _retry_pending_icecast_reload,
+    run,
 )
+from rtl_weatherband.soundcard import SoundcardDependencyError
 
 
 def destination(
@@ -83,6 +86,39 @@ class FakePipeline:
         self.icecast = icecast
 
 
+class FatalStartupPipeline:
+    def __init__(self, *args, **kwargs) -> None:
+        self.stopped = False
+
+    def start(self, encoded_outputs) -> None:
+        raise SoundcardDependencyError("pactl missing")
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+class StopRun(BaseException):
+    pass
+
+
+class CaptureStartupPipeline:
+    instances = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.args = args
+        self.kwargs = kwargs
+        self.started_outputs = None
+        self.stopped = False
+        self.__class__.instances.append(self)
+
+    def start(self, encoded_outputs) -> None:
+        self.started_outputs = list(encoded_outputs)
+        raise StopRun()
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
 def app_config(*destinations: IcecastConfig) -> AppConfig:
     return AppConfig(
         csdr_server=CsdrServerConfig(host="127.0.0.1", port=4951),
@@ -93,6 +129,66 @@ def app_config(*destinations: IcecastConfig) -> AppConfig:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_soundcard_dependency_error_hard_fails_startup(self) -> None:
+        config = app_config(destination("/one.mp3"))
+
+        with patch(
+            "rtl_weatherband.runner.IcecastSource",
+        ) as source_class, patch(
+            "rtl_weatherband.runner.StreamPipeline",
+            FatalStartupPipeline,
+        ):
+            source = source_class.return_value
+            source.connect.return_value = FakeSink()
+            with self.assertRaises(SoundcardDependencyError):
+                run(config)
+
+    def test_initial_icecast_connect_keeps_successful_destinations(self) -> None:
+        bad = destination("/bad.mp3")
+        good = destination("/good.mp3")
+        good_source = FakeSource(good)
+        good_sink = FakeSink()
+
+        with patch(
+            "rtl_weatherband.runner._connect_icecast",
+            side_effect=[
+                ConnectionError("bad password"),
+                (good_source, good_sink),
+            ],
+        ):
+            sources, outputs, connected = _connect_initial_icecast_outputs(
+                app_config(bad, good),
+            )
+
+        self.assertEqual(sources, [good_source])
+        self.assertEqual(outputs, [good_sink])
+        self.assertEqual(connected, (good,))
+
+    def test_startup_icecast_failure_does_not_block_pipeline_start(self) -> None:
+        bad = destination("/bad.mp3")
+        good = destination("/good.mp3")
+        good_source = FakeSource(good)
+        good_sink = FakeSink()
+        CaptureStartupPipeline.instances = []
+
+        with patch(
+            "rtl_weatherband.runner._connect_icecast",
+            side_effect=[
+                ConnectionError("bad password"),
+                (good_source, good_sink),
+            ],
+        ), patch(
+            "rtl_weatherband.runner.StreamPipeline",
+            CaptureStartupPipeline,
+        ):
+            with self.assertRaises(StopRun):
+                run(app_config(bad, good))
+
+        pipeline = CaptureStartupPipeline.instances[0]
+        self.assertEqual(pipeline.args[1], (good,))
+        self.assertEqual(pipeline.started_outputs, [good_sink])
+        self.assertTrue(pipeline.stopped)
+
     def test_icecast_diff_keeps_unchanged_destination(self) -> None:
         first = destination("/one.mp3")
         second = destination("/two.mp3")
@@ -315,6 +411,49 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(pipeline.calls, [])
         self.assertEqual(sources, [old_source])
         self.assertFalse(old_source.closed)
+
+    def test_icecast_reload_can_disable_destination(self) -> None:
+        old = destination("/one.mp3")
+        old_source = FakeSource(old)
+        sources = [old_source]
+        pipeline = FakePipeline()
+
+        applied = _apply_icecast_reload(
+            pipeline,
+            sources,
+            (old,),
+            (),
+            timeout=1.0,
+        )
+
+        self.assertTrue(applied)
+        self.assertEqual(pipeline.calls, [((), [old], [], True)])
+        self.assertEqual(sources, [])
+        self.assertTrue(old_source.closed)
+
+    def test_icecast_reload_can_reenable_destination(self) -> None:
+        new = destination("/one.mp3")
+        new_source = FakeSource(new)
+        sources = []
+        pipeline = FakePipeline()
+
+        with patch(
+            "rtl_weatherband.runner._connect_icecast",
+            return_value=(new_source, FakeSink()),
+        ) as connect:
+            applied = _apply_icecast_reload(
+                pipeline,
+                sources,
+                (),
+                (new,),
+                timeout=1.0,
+            )
+
+        self.assertTrue(applied)
+        connect.assert_called_once_with(new, 1.0)
+        self.assertEqual(pipeline.calls, [((new,), [], [new], True)])
+        self.assertEqual(sources, [new_source])
+        self.assertFalse(new_source.closed)
 
     def test_same_mount_reload_failure_restores_existing_output(self) -> None:
         old = destination("/same.mp3", password="old")

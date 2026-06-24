@@ -62,6 +62,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.fallback.silence_timeout_seconds, 30.0)
         self.assertEqual(config.fallback.loop_delay_seconds, 0.0)
         self.assertIsNone(config.fallback.path)
+        self.assertEqual(config.soundcard, ())
 
     def test_accepts_s16_csdr_server_iq_format(self) -> None:
         raw = valid_config()
@@ -115,6 +116,94 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.fallback.silence_timeout_seconds, 45)
         self.assertEqual(config.fallback.loop_delay_seconds, 2.5)
 
+    def test_accepts_soundcard_device_string(self) -> None:
+        raw = valid_config()
+        raw["soundcard"] = {
+            "enabled": True,
+            "device": "plughw:1,0",
+        }
+
+        config = parse_config(raw)
+
+        self.assertEqual(len(config.soundcard), 1)
+        self.assertTrue(config.soundcard[0].enabled)
+        self.assertEqual(config.soundcard[0].device, "plughw:1,0")
+
+    def test_accepts_soundcard_device_index(self) -> None:
+        raw = valid_config()
+        raw["soundcard"] = {
+            "enabled": True,
+            "device": 2,
+        }
+
+        config = parse_config(raw)
+
+        self.assertEqual(config.soundcard[0].device, 2)
+
+    def test_accepts_multiple_soundcard_outputs(self) -> None:
+        raw = valid_config()
+        raw["soundcard"] = {
+            "outputs": [
+                {"enabled": True, "device": "plughw:1"},
+                {"enabled": False, "device": "plughw:2"},
+                {"enabled": True, "device": "pulse:61"},
+            ],
+        }
+
+        config = parse_config(raw)
+
+        self.assertEqual([output.device for output in config.soundcard], ["plughw:1", "pulse:61"])
+
+    def test_disabled_soundcard_section_ignores_outputs(self) -> None:
+        raw = valid_config()
+        raw["soundcard"] = {
+            "enabled": False,
+            "outputs": [
+                {"enabled": True, "device": "plughw:1"},
+            ],
+        }
+
+        config = parse_config(raw)
+
+        self.assertEqual(config.soundcard, ())
+
+    def test_disabled_legacy_soundcard_output_is_ignored(self) -> None:
+        raw = valid_config()
+        raw["soundcard"] = {
+            "enabled": False,
+            "device": "plughw:1",
+        }
+
+        config = parse_config(raw)
+
+        self.assertEqual(config.soundcard, ())
+
+    def test_rejects_string_soundcard_enabled(self) -> None:
+        raw = valid_config()
+        raw["soundcard"] = {
+            "enabled": "false",
+        }
+        with self.assertRaisesRegex(ConfigError, "enabled"):
+            parse_config(raw)
+
+    def test_rejects_string_soundcard_section_enabled_with_outputs(self) -> None:
+        raw = valid_config()
+        raw["soundcard"] = {
+            "enabled": "false",
+            "outputs": [],
+        }
+        with self.assertRaisesRegex(ConfigError, "enabled"):
+            parse_config(raw)
+
+    def test_rejects_empty_soundcard_device(self) -> None:
+        raw = valid_config()
+        raw["soundcard"] = {
+            "enabled": True,
+            "device": "",
+        }
+        with self.assertRaisesRegex(ConfigError, "device"):
+            parse_config(raw)
+
     def test_rejects_fallback_timeout_below_minimum(self) -> None:
         raw = valid_config()
         raw["fallback"] = {
@@ -156,6 +245,42 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.icecast[0].mount, "/nwr.mp3")
         self.assertEqual(config.icecast[1].mount, "/nwr.ogg")
         self.assertEqual(config.icecast[1].content_type, "application/ogg")
+
+    def test_disabled_icecast_destination_is_ignored(self) -> None:
+        raw = valid_config()
+        first = raw["icecast"]
+        second = dict(first)
+        second["mount"] = "disabled.mp3"
+        second["enabled"] = False
+        raw["icecast"] = {"destinations": [first, second]}
+
+        config = parse_config(raw)
+
+        self.assertEqual(len(config.icecast), 1)
+        self.assertEqual(config.icecast[0].mount, "/nwr.mp3")
+
+    def test_disabled_icecast_section_ignores_destinations(self) -> None:
+        raw = valid_config()
+        first = raw["icecast"]
+        raw["icecast"] = {
+            "enabled": False,
+            "destinations": [first],
+        }
+
+        config = parse_config(raw)
+
+        self.assertEqual(config.icecast, ())
+
+    def test_rejects_string_icecast_section_enabled_with_destinations(self) -> None:
+        raw = valid_config()
+        first = raw["icecast"]
+        raw["icecast"] = {
+            "enabled": "false",
+            "destinations": [first],
+        }
+
+        with self.assertRaisesRegex(ConfigError, "enabled"):
+            parse_config(raw)
 
     def test_rejects_out_of_range_frequency(self) -> None:
         raw = valid_config()
@@ -384,6 +509,58 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.fallback, current.fallback)
         self.assertTrue(any("fallback:" in error for error in errors))
+
+    def test_reload_keeps_old_soundcard_when_new_soundcard_is_invalid(self) -> None:
+        current_raw = valid_config()
+        current_raw["soundcard"] = {
+            "enabled": True,
+            "device": "plughw:1,0",
+        }
+        current = parse_config(current_raw)
+        raw = valid_config()
+        raw["soundcard"] = {
+            "enabled": "false",
+        }
+
+        config, errors = merge_valid_reload_config(raw, current)
+
+        self.assertEqual(config.soundcard, current.soundcard)
+        self.assertTrue(any("soundcard:" in error for error in errors))
+
+    def test_reload_can_disable_soundcard_section_with_outputs(self) -> None:
+        current_raw = valid_config()
+        current_raw["soundcard"] = {
+            "outputs": [
+                {"enabled": True, "device": "plughw:1"},
+            ],
+        }
+        current = parse_config(current_raw)
+        raw = valid_config()
+        raw["soundcard"] = {
+            "enabled": False,
+            "outputs": [
+                {"enabled": True, "device": "plughw:1"},
+            ],
+        }
+
+        config, errors = merge_valid_reload_config(raw, current)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(config.soundcard, ())
+
+    def test_reload_can_disable_icecast_section_with_destinations(self) -> None:
+        current = parse_config(valid_config())
+        raw = valid_config()
+        first = raw["icecast"]
+        raw["icecast"] = {
+            "enabled": False,
+            "destinations": [first],
+        }
+
+        config, errors = merge_valid_reload_config(raw, current)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(config.icecast, ())
 
     def test_reload_keeps_old_buffer_when_new_buffer_exceeds_fallback(self) -> None:
         current = parse_config(valid_config())

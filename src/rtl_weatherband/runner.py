@@ -12,6 +12,7 @@ from typing import BinaryIO
 from .config import AppConfig, IcecastConfig, load_raw_config, merge_valid_reload_config
 from .icecast import IcecastSource
 from .pipeline import ProcessExit, StreamPipeline
+from .soundcard import SoundcardFatalError
 
 
 LOG = logging.getLogger(__name__)
@@ -31,6 +32,8 @@ class IcecastReloadPlan:
 
 
 def run(config: AppConfig, config_path: str | Path | None = None) -> None:
+    desired_config = config
+    active_config = config
     reload_event = threading.Event()
     pending_icecast_config: AppConfig | None = None
     next_icecast_retry_at = 0.0
@@ -39,30 +42,26 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
         LOG.info("SIGHUP config reload enabled for %s", config_path)
 
     while True:
-        icecast_sources: list[IcecastSource] = []
-        encoded_outputs = []
+        icecast_sources, encoded_outputs, active_icecast = _connect_initial_icecast_outputs(
+            desired_config,
+        )
+        active_config = _with_icecast(desired_config, active_icecast)
+        pending_icecast_config = (
+            desired_config
+            if active_config.icecast != desired_config.icecast
+            else None
+        )
+        if pending_icecast_config is not None:
+            next_icecast_retry_at = time.monotonic() + RECONNECT_DELAY_SECONDS
         pipeline = StreamPipeline(
-            config.audio,
-            config.icecast,
-            config.csdr_server,
-            config.station.frequency_hz,
-            config.fallback,
+            active_config.audio,
+            active_config.icecast,
+            active_config.csdr_server,
+            active_config.station.frequency_hz,
+            active_config.fallback,
+            active_config.soundcard,
         )
         try:
-            for destination in config.icecast:
-                icecast = IcecastSource(
-                    destination,
-                    destination.content_type,
-                    timeout_seconds=config.csdr_server.timeout,
-                )
-                LOG.info(
-                    "connecting to Icecast at %s:%s%s",
-                    destination.host,
-                    destination.port,
-                    destination.mount,
-                )
-                encoded_outputs.append(icecast.connect())
-                icecast_sources.append(icecast)
             pipeline.start(encoded_outputs)
             LOG.info("streaming started")
             reconnect_delay = True
@@ -74,28 +73,30 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
                 if reload_event.is_set() and config_path is not None:
                     reload_event.clear()
                     LOG.info("SIGHUP received; reloading config from %s", config_path)
-                    new_config = _load_reload_config(config_path, config)
-                    _log_reload_changes(config, new_config)
-                    if new_config.icecast != config.icecast:
+                    new_config = _load_reload_config(config_path, desired_config)
+                    _log_reload_changes(desired_config, new_config)
+                    desired_config = new_config
+                    if new_config.icecast != active_config.icecast:
                         pending_icecast_config = new_config
                         if _retry_pending_icecast_reload(
                             pipeline,
                             icecast_sources,
-                            config,
+                            active_config,
                             pending_icecast_config,
                         ):
-                            config = pipeline.apply_runtime_config(
+                            active_config = pipeline.apply_runtime_config(
                                 pending_icecast_config
                             )
                             pending_icecast_config = None
                         else:
-                            config = pipeline.apply_runtime_config(
+                            active_config = pipeline.apply_runtime_config(
                                 AppConfig(
                                     csdr_server=new_config.csdr_server,
                                     station=new_config.station,
-                                    icecast=config.icecast,
+                                    icecast=active_config.icecast,
                                     audio=new_config.audio,
                                     fallback=new_config.fallback,
+                                    soundcard=new_config.soundcard,
                                 )
                             )
                             next_icecast_retry_at = (
@@ -103,7 +104,7 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
                             )
                     else:
                         pending_icecast_config = None
-                        config = pipeline.apply_runtime_config(new_config)
+                        active_config = pipeline.apply_runtime_config(new_config)
                     LOG.info("config reload applied")
                 if (
                     pending_icecast_config is not None
@@ -112,16 +113,18 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
                     if _retry_pending_icecast_reload(
                         pipeline,
                         icecast_sources,
-                        config,
+                        active_config,
                         pending_icecast_config,
                     ):
-                        config = pipeline.apply_runtime_config(pending_icecast_config)
+                        active_config = pipeline.apply_runtime_config(pending_icecast_config)
                         pending_icecast_config = None
                     else:
                         next_icecast_retry_at = (
                             time.monotonic() + RECONNECT_DELAY_SECONDS
                         )
                 time.sleep(0.25)
+        except SoundcardFatalError:
+            raise
         except Exception as exc:
             LOG.warning(
                 "stream setup failed: %s; retrying in %s seconds",
@@ -137,7 +140,7 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
         if reconnect_delay:
             if reload_event.wait(RECONNECT_DELAY_SECONDS) and config_path is not None:
                 reload_event.clear()
-                config = _load_reload_config(config_path, config)
+                desired_config = _load_reload_config(config_path, desired_config)
 
 
 def _load_reload_config(config_path: str | Path, current: AppConfig) -> AppConfig:
@@ -159,6 +162,41 @@ def _load_reload_config(config_path: str | Path, current: AppConfig) -> AppConfi
         config.audio,
     )
     return config
+
+
+def _connect_initial_icecast_outputs(
+    config: AppConfig,
+) -> tuple[list[IcecastSource], list[BinaryIO], tuple[IcecastConfig, ...]]:
+    icecast_sources: list[IcecastSource] = []
+    encoded_outputs: list[BinaryIO] = []
+    connected_configs: list[IcecastConfig] = []
+    failed_configs: list[IcecastConfig] = []
+    for destination in config.icecast:
+        try:
+            source, encoded_output = _connect_icecast(
+                destination,
+                config.csdr_server.timeout,
+            )
+        except Exception as exc:
+            LOG.warning(
+                "initial Icecast connection failed for %s: %s; destination will "
+                "retry in %s seconds",
+                _icecast_label(destination),
+                exc,
+                RECONNECT_DELAY_SECONDS,
+            )
+            failed_configs.append(destination)
+            continue
+        icecast_sources.append(source)
+        encoded_outputs.append(encoded_output)
+        connected_configs.append(destination)
+    if failed_configs:
+        LOG.warning(
+            "starting without %s Icecast destination(s): %s",
+            len(failed_configs),
+            [_icecast_label(config) for config in failed_configs],
+        )
+    return icecast_sources, encoded_outputs, tuple(connected_configs)
 
 
 def _retry_pending_icecast_reload(
@@ -370,6 +408,20 @@ def _without_configs(
     return tuple(remaining)
 
 
+def _with_icecast(
+    config: AppConfig,
+    icecast: tuple[IcecastConfig, ...],
+) -> AppConfig:
+    return AppConfig(
+        csdr_server=config.csdr_server,
+        station=config.station,
+        icecast=icecast,
+        audio=config.audio,
+        fallback=config.fallback,
+        soundcard=config.soundcard,
+    )
+
+
 def _connect_icecast(
     config: IcecastConfig,
     timeout: float,
@@ -506,6 +558,8 @@ def _log_reload_changes(current: AppConfig, new: AppConfig) -> None:
     if new.audio != current.audio:
         LOG.info("config reload changed audio settings")
         LOG.debug("audio config changed from %r to %r", current.audio, new.audio)
+    if new.soundcard != current.soundcard:
+        LOG.info("config reload changed soundcard output settings")
 
 
 def _log_pipeline_exit(process_exit: ProcessExit) -> None:
