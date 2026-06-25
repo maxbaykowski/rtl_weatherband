@@ -710,7 +710,9 @@ class PipelineTests(unittest.TestCase):
             thread=threading.Thread(),
         )
         pipeline.encoder_groups.append(encoder_group)
-        pipeline._queue_audio(np.full(SILENCE_FRAME_SAMPLES, 0.25, dtype=np.float32))
+        times = np.arange(SILENCE_FRAME_SAMPLES, dtype=np.float32) / 16000
+        source = (np.sin(2 * np.pi * 1000 * times) * 0.25).astype(np.float32)
+        pipeline._queue_audio(source)
 
         try:
             thread = threading.Thread(target=pipeline._run_pcm_playback_worker)
@@ -722,8 +724,9 @@ class PipelineTests(unittest.TestCase):
             pipeline.stop_event.set()
 
         samples = np.frombuffer(frame, dtype="<i2")
-        self.assertGreater(np.mean(samples), 16000)
-        self.assertLess(np.mean(samples), 16500)
+        sample_rms = np.sqrt(np.mean(np.square(samples.astype(np.float32))))
+        self.assertGreater(sample_rms, 11000)
+        self.assertLess(sample_rms, 12000)
 
     def test_hotswap_probe_reads_only_available_iq_chunk(self) -> None:
         pipeline = self.make_pipeline()

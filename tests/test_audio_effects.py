@@ -6,6 +6,7 @@ import numpy as np
 
 from rtl_weatherband.audio_effects import (
     AudioEffectsProcessor,
+    DcBlocker,
     highpass_mix_for_sharpness,
     tap_count_for_sharpness,
 )
@@ -65,11 +66,55 @@ class AudioEffectsTests(unittest.TestCase):
                 volume=VolumeConfig(enabled=True, multiplier=2.0),
             )
         )
-        source = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+        reference = AudioEffectsProcessor(
+            AudioConfig(
+                deemphasis=DeemphasisConfig(enabled=False),
+            )
+        )
+        source = sine(1000, seconds=1.0) * 0.25
+
+        output = processor.process(source)
+        reference_output = reference.process(source)
+
+        self.assertGreater(steady_rms(output), steady_rms(reference_output) * 1.95)
+        self.assertLess(steady_rms(output), steady_rms(reference_output) * 2.05)
+
+    def test_dc_blocker_removes_constant_bias_across_chunks(self) -> None:
+        blocker = DcBlocker()
+        source = np.full(16000, 0.25, dtype=np.float32)
+
+        output = np.concatenate(
+            (
+                blocker.process(source[:4000]),
+                blocker.process(source[4000:]),
+            )
+        )
+
+        self.assertLess(abs(float(np.mean(output[-4000:]))), 0.001)
+
+    def test_audio_processor_always_removes_dc_when_deemphasis_is_disabled(self) -> None:
+        processor = AudioEffectsProcessor(
+            AudioConfig(
+                deemphasis=DeemphasisConfig(enabled=False),
+            )
+        )
+        source = np.full(16000, 0.2, dtype=np.float32)
 
         output = processor.process(source)
 
-        np.testing.assert_allclose(output, source * 2)
+        self.assertLess(abs(float(np.mean(output[-4000:]))), 0.001)
+
+    def test_audio_processor_removes_dc_after_deemphasis(self) -> None:
+        processor = AudioEffectsProcessor(
+            AudioConfig(
+                deemphasis=DeemphasisConfig(enabled=True),
+            )
+        )
+        source = np.full(16000, 0.2, dtype=np.float32)
+
+        output = processor.process(source)
+
+        self.assertLess(abs(float(np.mean(output[-4000:]))), 0.001)
 
     def test_highpass_reduces_low_frequency_audio(self) -> None:
         processor = AudioEffectsProcessor(

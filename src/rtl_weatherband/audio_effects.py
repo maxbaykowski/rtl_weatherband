@@ -11,6 +11,7 @@ from .deemphasis import DeemphasisFilter
 
 MIN_FILTER_TAPS = 5
 MAX_FILTER_TAPS = 1025
+DC_BLOCK_CUTOFF_HZ = 20.0
 
 
 @dataclass
@@ -52,6 +53,34 @@ class FirFilter:
 
 
 @dataclass
+class DcBlocker:
+    sample_rate: int = IQ_SAMPLE_RATE
+    cutoff_hz: float = DC_BLOCK_CUTOFF_HZ
+    _previous_input: float = 0.0
+    _previous_output: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.coefficient = float(np.exp(-2.0 * np.pi * self.cutoff_hz / self.sample_rate))
+
+    def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
+        if len(samples) == 0:
+            return samples
+        output = np.empty_like(samples, dtype=np.float32)
+        previous_input = self._previous_input
+        previous_output = self._previous_output
+        coefficient = self.coefficient
+        for index, sample in enumerate(samples):
+            current = float(sample)
+            filtered = current - previous_input + coefficient * previous_output
+            output[index] = filtered
+            previous_input = current
+            previous_output = filtered
+        self._previous_input = previous_input
+        self._previous_output = previous_output
+        return output
+
+
+@dataclass
 class AudioEffectsProcessor:
     config: AudioConfig
     sample_rate: int = IQ_SAMPLE_RATE
@@ -61,12 +90,14 @@ class AudioEffectsProcessor:
             self.sample_rate,
             self.config.deemphasis_tau,
         )
+        self.dc_blocker = DcBlocker(self.sample_rate)
         self.highpass = _build_filter("highpass", self.config.highpass, self.sample_rate)
         self.lowpass = _build_filter("lowpass", self.config.lowpass, self.sample_rate)
         self.notch = _build_filter("notch", self.config.notch, self.sample_rate)
 
     def process(self, samples: NDArray[np.float32]) -> NDArray[np.float32]:
         audio = self.deemphasis.process_float(samples)
+        audio = self.dc_blocker.process(audio)
         if self.highpass is not None:
             audio = self.highpass.process(audio)
         if self.lowpass is not None:
