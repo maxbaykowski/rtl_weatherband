@@ -102,6 +102,24 @@ Keep as "f32" unless you're connecting to a csdr_server instance on LAN or WAN.
     // path: "/path/to/fallback.wav",
   },
 
+  // Record EAS/SAME alerts from the same audio sent to Icecast and soundcard outputs.
+  eas_recording: {
+    // Requires the easrecorder Python package and multimon-ng.
+    enabled: false,
+    // Seconds of audio to prepend before the decoded SAME header. Valid range: 0 through 10.
+    pre_seconds: 2,
+    // Seconds of audio to append after EOM. Valid range: 0 through 10.
+    post_seconds: 5,
+    // Maximum recording length for a single alert, in seconds.
+    max_seconds: 120,
+    // Directory where alert recordings and index.json will be saved.
+    directory: "./alerts",
+    // Recording format: "wav" or "mp3".
+    format: "wav",
+    // Use local time in generated filenames instead of UTC.
+    local_time: false,
+  },
+
   audio: {
     // NFM deemphasis filter for reducing high frequency content.
     deemphasis: {

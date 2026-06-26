@@ -20,6 +20,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="enable debug logging",
     )
+    parser.add_argument(
+        "--test-same",
+        action="store_true",
+        help="inject a locally generated SAME test alert instead of SDR audio",
+    )
     return parser
 
 
@@ -32,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         config = load_config(args.config)
-        run(config, args.config)
+        run(config, args.config, same_test=args.test_same)
     except KeyboardInterrupt:
         return 130
     except ConfigError as exc:

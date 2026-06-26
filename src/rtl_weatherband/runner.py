@@ -31,7 +31,18 @@ class IcecastReloadPlan:
         return bool(self.replacements or self.pure_removes or self.pure_adds)
 
 
-def run(config: AppConfig, config_path: str | Path | None = None) -> None:
+@dataclass(frozen=True)
+class ReloadResult:
+    config: AppConfig
+    had_errors: bool = False
+
+
+def run(
+    config: AppConfig,
+    config_path: str | Path | None = None,
+    *,
+    same_test: bool = False,
+) -> None:
     desired_config = config
     active_config = config
     reload_event = threading.Event()
@@ -60,6 +71,8 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
             active_config.station.frequency_hz,
             active_config.fallback,
             active_config.soundcard,
+            active_config.eas_recording,
+            same_test,
         )
         try:
             pipeline.start(encoded_outputs)
@@ -73,8 +86,15 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
                 if reload_event.is_set() and config_path is not None:
                     reload_event.clear()
                     LOG.info("SIGHUP received; reloading config from %s", config_path)
-                    new_config = _load_reload_config(config_path, desired_config)
+                    reload_result = _load_reload_config(config_path, desired_config)
+                    new_config = reload_result.config
                     _log_reload_changes(desired_config, new_config)
+                    if _should_queue_same_test_alert(
+                        same_test,
+                        desired_config,
+                        reload_result,
+                    ):
+                        pipeline.request_same_test_alert()
                     desired_config = new_config
                     if new_config.icecast != active_config.icecast:
                         pending_icecast_config = new_config
@@ -97,6 +117,7 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
                                     audio=new_config.audio,
                                     fallback=new_config.fallback,
                                     soundcard=new_config.soundcard,
+                                    eas_recording=new_config.eas_recording,
                                 )
                             )
                             next_icecast_retry_at = (
@@ -140,16 +161,16 @@ def run(config: AppConfig, config_path: str | Path | None = None) -> None:
         if reconnect_delay:
             if reload_event.wait(RECONNECT_DELAY_SECONDS) and config_path is not None:
                 reload_event.clear()
-                desired_config = _load_reload_config(config_path, desired_config)
+                desired_config = _load_reload_config(config_path, desired_config).config
 
 
-def _load_reload_config(config_path: str | Path, current: AppConfig) -> AppConfig:
+def _load_reload_config(config_path: str | Path, current: AppConfig) -> ReloadResult:
     LOG.debug("loading reload config from %s", config_path)
     try:
         raw = load_raw_config(config_path)
     except Exception as exc:
         LOG.error("config reload failed; keeping existing configuration: %s", exc)
-        return current
+        return ReloadResult(current, had_errors=True)
     config, errors = merge_valid_reload_config(raw, current)
     for error in errors:
         LOG.error("config reload kept existing %s", error)
@@ -161,7 +182,15 @@ def _load_reload_config(config_path: str | Path, current: AppConfig) -> AppConfi
         [_icecast_label(destination) for destination in config.icecast],
         config.audio,
     )
-    return config
+    return ReloadResult(config, had_errors=bool(errors))
+
+
+def _should_queue_same_test_alert(
+    same_test: bool,
+    current: AppConfig,
+    reload_result: ReloadResult,
+) -> bool:
+    return same_test and not reload_result.had_errors and reload_result.config == current
 
 
 def _connect_initial_icecast_outputs(
@@ -419,6 +448,7 @@ def _with_icecast(
         audio=config.audio,
         fallback=config.fallback,
         soundcard=config.soundcard,
+        eas_recording=config.eas_recording,
     )
 
 
@@ -560,6 +590,8 @@ def _log_reload_changes(current: AppConfig, new: AppConfig) -> None:
         LOG.debug("audio config changed from %r to %r", current.audio, new.audio)
     if new.soundcard != current.soundcard:
         LOG.info("config reload changed soundcard output settings")
+    if new.eas_recording != current.eas_recording:
+        LOG.info("config reload changed EAS recording settings")
 
 
 def _log_pipeline_exit(process_exit: ProcessExit) -> None:

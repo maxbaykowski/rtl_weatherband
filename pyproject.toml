@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rtl_weatherband"
-version = "0.5.0"
+version = "0.6.0"
 description = "Stream NOAA Weather Radio audio from an RTL SDR to multiple Icecast servers."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "csdr-server @ git+https://github.com/maxbaykowski/csdr_server.git@main",
+  "easrecorder @ git+https://github.com/maxbaykowski/easrecorder.git@main",
   "json5>=0.9.0",
   "lameenc>=1.8.2",
   "numpy>=1.26",
@@ -25,4 +26,4 @@ rtl_weatherband = "rtl_weatherband.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-rtl_weatherband = ["assets/fallback.wav"]
+rtl_weatherband = ["assets/fallback.wav", "assets/same_test.wav"]

@@ -140,6 +140,17 @@ class SoundcardConfig:
 
 
 @dataclass(frozen=True)
+class EasRecordingConfig:
+    enabled: bool = False
+    pre_seconds: float = 2.0
+    post_seconds: float = 5.0
+    max_seconds: int = 120
+    directory: str = "alerts"
+    format: str = "wav"
+    local_time: bool = False
+
+
+@dataclass(frozen=True)
 class AppConfig:
     csdr_server: CsdrServerConfig
     station: StationConfig
@@ -147,6 +158,7 @@ class AppConfig:
     audio: AudioConfig
     fallback: FallbackConfig = field(default_factory=FallbackConfig)
     soundcard: tuple[SoundcardConfig, ...] = field(default_factory=tuple)
+    eas_recording: EasRecordingConfig = field(default_factory=EasRecordingConfig)
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -171,6 +183,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
     audio = _section(raw, "audio")
     fallback = raw.get("fallback")
     soundcard = raw.get("soundcard")
+    eas_recording = raw.get("eas_recording")
 
     app = AppConfig(
         csdr_server=parse_csdr_server_config(csdr_server),
@@ -179,6 +192,7 @@ def parse_config(raw: dict[str, Any]) -> AppConfig:
         audio=parse_audio_config(audio),
         fallback=parse_fallback_config(fallback),
         soundcard=parse_soundcard_config(soundcard),
+        eas_recording=parse_eas_recording_config(eas_recording),
     )
     validate_config(app)
     return app
@@ -241,6 +255,13 @@ def merge_valid_reload_config(
         errors.append(f"soundcard: {exc}")
         soundcard = current.soundcard
 
+    try:
+        eas_recording = parse_eas_recording_config(raw.get("eas_recording"))
+        validate_eas_recording_config(eas_recording)
+    except (ConfigError, KeyError, TypeError, ValueError) as exc:
+        errors.append(f"eas_recording: {exc}")
+        eas_recording = current.eas_recording
+
     return AppConfig(
         csdr_server=csdr_server,
         station=station,
@@ -248,6 +269,7 @@ def merge_valid_reload_config(
         audio=audio,
         fallback=fallback,
         soundcard=soundcard,
+        eas_recording=eas_recording,
     ), errors
 
 
@@ -473,6 +495,24 @@ def parse_soundcard_output_config(raw: dict[str, Any]) -> SoundcardConfig:
     )
 
 
+def parse_eas_recording_config(raw: Any) -> EasRecordingConfig:
+    if raw is None:
+        return EasRecordingConfig()
+    raw = _object(raw, "eas_recording")
+    max_seconds = raw.get("max_seconds", 120)
+    if not isinstance(max_seconds, int) or isinstance(max_seconds, bool):
+        raise ConfigError("eas_recording.max_seconds must be an integer")
+    return EasRecordingConfig(
+        enabled=_bool(raw, "enabled", False),
+        pre_seconds=float(raw.get("pre_seconds", 2.0)),
+        post_seconds=float(raw.get("post_seconds", 5.0)),
+        max_seconds=max_seconds,
+        directory=_str(raw, "directory", "alerts"),
+        format=_str(raw, "format", "wav").lower(),
+        local_time=_bool(raw, "local_time", False),
+    )
+
+
 def validate_config(config: AppConfig) -> None:
     validate_station_config(config.station)
     validate_csdr_server_config(config.csdr_server)
@@ -480,6 +520,7 @@ def validate_config(config: AppConfig) -> None:
     validate_audio_config(config.audio)
     validate_fallback_config(config.fallback)
     validate_soundcard_configs(config.soundcard)
+    validate_eas_recording_config(config.eas_recording)
     validate_buffer_config(config.csdr_server, config.fallback)
 
 
@@ -605,6 +646,22 @@ def validate_soundcard_configs(configs: tuple[SoundcardConfig, ...]) -> None:
             errors.append(f"soundcard output {index}: {exc}")
     if errors:
         raise ConfigError("; ".join(errors))
+
+
+def validate_eas_recording_config(config: EasRecordingConfig) -> None:
+    if not config.enabled:
+        return
+    if not _finite(config.pre_seconds) or not 0 <= config.pre_seconds <= 10:
+        raise ConfigError("eas_recording.pre_seconds must be between 0 and 10")
+    if not _finite(config.post_seconds) or not 0 <= config.post_seconds <= 10:
+        raise ConfigError("eas_recording.post_seconds must be between 0 and 10")
+    if config.max_seconds <= 0:
+        raise ConfigError("eas_recording.max_seconds must be greater than 0")
+    if config.format not in {"mp3", "wav"}:
+        raise ConfigError("eas_recording.format must be either 'mp3' or 'wav'")
+    directory = Path(config.directory).expanduser()
+    if directory.exists() and not directory.is_dir():
+        raise ConfigError("eas_recording.directory must be a directory")
 
 
 def validate_buffer_config(

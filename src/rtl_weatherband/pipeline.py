@@ -6,7 +6,9 @@ import select
 import socket
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import BinaryIO
 
 import numpy as np
@@ -15,6 +17,8 @@ from .config import (
     AppConfig,
     AudioConfig,
     CsdrServerConfig,
+    DeemphasisConfig,
+    EasRecordingConfig,
     FallbackConfig,
     IcecastConfig,
     IQ_SAMPLE_RATE,
@@ -24,6 +28,7 @@ from .config import (
 from .csdr_server import CsdrServerError, IqStream, open_iq_stream
 from .audio_effects import AudioEffectsProcessor
 from .encoder import AudioEncoder, PcmResampler, create_audio_encoder
+from .eas_recording import EasRecorderOutput, generate_same_test_audio
 from .fallback_audio import FallbackAudio, load_fallback_audio
 from .nfm import NfmDemodulator, float_to_s16
 from .soundcard import (
@@ -49,6 +54,10 @@ AUDIO_FRAME_BYTES = SILENCE_FRAME_SAMPLES * np.dtype("<f4").itemsize
 PCM_QUEUE_CHUNKS = 100
 RECONNECT_DELAY_SECONDS = 5
 PCM_BUFFER_LOW_WATER_RATIO = 0.25
+SAME_TEST_INTER_ALERT_SILENCE_SECONDS = 1.0
+SAME_TEST_INTER_ALERT_SILENCE_FRAMES = round(
+    SAME_TEST_INTER_ALERT_SILENCE_SECONDS / SILENCE_FRAME_SECONDS
+)
 
 
 @dataclass(frozen=True)
@@ -89,6 +98,13 @@ class SoundcardWorker:
 
 
 @dataclass
+class EasRecorderWorker:
+    config: EasRecordingConfig
+    output: EasRecorderOutput
+    error: BaseException | None = None
+
+
+@dataclass
 class FallbackPlaybackState:
     position: int = 0
     delay_samples_remaining: int = 0
@@ -108,9 +124,14 @@ class StreamPipeline:
     frequency_hz: int
     fallback: FallbackConfig = field(default_factory=FallbackConfig)
     soundcard: tuple[SoundcardConfig, ...] = field(default_factory=tuple)
+    eas_recording: EasRecordingConfig = field(default_factory=EasRecordingConfig)
+    same_test: bool = False
     outputs: list[OutputWorker] = field(default_factory=list)
     encoder_groups: list[EncoderWorker] = field(default_factory=list)
     soundcard_workers: list[SoundcardWorker] = field(default_factory=list)
+    eas_recorder_worker: EasRecorderWorker | None = None
+    same_test_alerts: deque[np.ndarray] = field(default_factory=deque)
+    same_test_lock: threading.Lock = field(default_factory=threading.Lock)
     pcm_queue: queue.Queue[bytes] = field(default_factory=lambda: queue.Queue(maxsize=PCM_QUEUE_CHUNKS))
     playback_thread: threading.Thread | None = None
     producer_thread: threading.Thread | None = None
@@ -147,6 +168,7 @@ class StreamPipeline:
         self.outputs = []
         self.encoder_groups = []
         self.soundcard_workers = []
+        self.eas_recorder_worker = None
         self.fallback_state.reset()
         self.pcm_buffer_ready = False
         self.pcm_buffer_target_bytes = 0
@@ -159,6 +181,9 @@ class StreamPipeline:
         self.soundcard_workers = self._create_soundcard_workers(
             self.soundcard,
             tolerate_output_failures=True,
+        )
+        self.eas_recorder_worker = self._create_eas_recorder_worker(
+            self.eas_recording,
         )
         self.producer_thread.start()
         self.playback_thread.start()
@@ -224,6 +249,9 @@ class StreamPipeline:
         for soundcard_worker in list(self.soundcard_workers):
             self._stop_soundcard_worker(soundcard_worker)
         self.soundcard_workers = []
+        if self.eas_recorder_worker is not None:
+            self._stop_eas_recorder_worker(self.eas_recorder_worker)
+        self.eas_recorder_worker = None
         self._clear_pcm_queue(self.pcm_queue)
 
     def apply_icecast_outputs(
@@ -409,6 +437,20 @@ class StreamPipeline:
                 )
             seen[key] = worker
 
+    def _create_eas_recorder_worker(
+        self,
+        config: EasRecordingConfig,
+    ) -> EasRecorderWorker | None:
+        if not config.enabled:
+            return None
+        return EasRecorderWorker(
+            config=config,
+            output=EasRecorderOutput(config),
+        )
+
+    def _stop_eas_recorder_worker(self, worker: EasRecorderWorker) -> None:
+        worker.output.close()
+
     def apply_runtime_config(self, config: AppConfig) -> AppConfig:
         applied = config
         with self.state_lock:
@@ -419,6 +461,8 @@ class StreamPipeline:
                 LOG.info("updated fallback audio settings")
             old_soundcard = self.soundcard
             soundcard_changed = config.soundcard != self.soundcard
+            old_eas_recording = self.eas_recording
+            eas_recording_changed = config.eas_recording != self.eas_recording
             server_changed = _csdr_connection_changed(config.csdr_server, self.csdr_server)
             frequency_changed = config.station.frequency_hz != self.frequency_hz
             if server_changed:
@@ -460,9 +504,24 @@ class StreamPipeline:
                     audio=config.audio,
                     fallback=config.fallback,
                     soundcard=old_soundcard,
+                    eas_recording=config.eas_recording,
                 )
                 with self.state_lock:
                     self.soundcard = old_soundcard
+
+        if eas_recording_changed:
+            if not self._apply_eas_recording_config(config.eas_recording):
+                applied = AppConfig(
+                    csdr_server=config.csdr_server,
+                    station=config.station,
+                    icecast=config.icecast,
+                    audio=config.audio,
+                    fallback=config.fallback,
+                    soundcard=applied.soundcard,
+                    eas_recording=old_eas_recording,
+                )
+                with self.state_lock:
+                    self.eas_recording = old_eas_recording
 
         if stream is not None:
             if self._retune_stream(stream, frequency_hz, timeout):
@@ -477,6 +536,7 @@ class StreamPipeline:
                     audio=config.audio,
                     fallback=config.fallback,
                     soundcard=applied.soundcard,
+                    eas_recording=applied.eas_recording,
                 )
         else:
             with self.state_lock:
@@ -527,7 +587,25 @@ class StreamPipeline:
             LOG.info("updated soundcard output settings")
         return True
 
+    def _apply_eas_recording_config(self, config: EasRecordingConfig) -> bool:
+        try:
+            new_worker = self._create_eas_recorder_worker(config)
+        except Exception as exc:
+            LOG.warning("EAS recording config reload failed; keeping existing recorder: %s", exc)
+            return False
+        old_worker = self.eas_recorder_worker
+        self.eas_recorder_worker = new_worker
+        if old_worker is not None:
+            self._stop_eas_recorder_worker(old_worker)
+        with self.state_lock:
+            self.eas_recording = config
+        LOG.info("updated EAS recording settings")
+        return True
+
     def _run_iq_producer(self) -> None:
+        if self.same_test:
+            self._run_same_test_producer()
+            return
         while not self.stop_event.is_set():
             try:
                 csdr_server, frequency_hz = self._receiver_config()
@@ -561,6 +639,64 @@ class StreamPipeline:
                     iq_stream.close()
 
             self._sleep_until_reconnect()
+
+    def _run_same_test_producer(self) -> None:
+        LOG.info("starting local SAME test audio generator")
+        active_alert: np.ndarray | None = None
+        position = 0
+        inter_alert_silence_frames = 0
+        while not self.stop_event.is_set():
+            if active_alert is None and inter_alert_silence_frames <= 0:
+                active_alert = self._pop_same_test_alert()
+                position = 0
+
+            if inter_alert_silence_frames > 0:
+                self._queue_audio(np.zeros(SILENCE_FRAME_SAMPLES, dtype=np.float32))
+                inter_alert_silence_frames -= 1
+            elif active_alert is None:
+                self._queue_audio(np.zeros(SILENCE_FRAME_SAMPLES, dtype=np.float32))
+            else:
+                frame = active_alert[position : position + SILENCE_FRAME_SAMPLES]
+                if len(frame) < SILENCE_FRAME_SAMPLES:
+                    padded = np.zeros(SILENCE_FRAME_SAMPLES, dtype=np.float32)
+                    if len(frame):
+                        padded[: len(frame)] = frame
+                    self._queue_audio(padded)
+                    active_alert = None
+                    position = 0
+                    inter_alert_silence_frames = SAME_TEST_INTER_ALERT_SILENCE_FRAMES
+                else:
+                    self._queue_audio(frame)
+                    position += SILENCE_FRAME_SAMPLES
+                    if position >= len(active_alert):
+                        active_alert = None
+                        position = 0
+                        inter_alert_silence_frames = SAME_TEST_INTER_ALERT_SILENCE_FRAMES
+            time.sleep(SILENCE_FRAME_SECONDS)
+        LOG.info("local SAME test audio generator stopped")
+
+    def request_same_test_alert(self) -> None:
+        origin_time = datetime.now(timezone.utc)
+        alert = generate_same_test_audio(origin_time=origin_time)
+        with self.same_test_lock:
+            self.same_test_alerts.append(alert)
+        LOG.info("queued local SAME DMO test alert")
+
+    def _pop_same_test_alert(self) -> np.ndarray | None:
+        with self.same_test_lock:
+            if not self.same_test_alerts:
+                return None
+            return self.same_test_alerts.popleft()
+
+    def _play_same_test_alert(self, origin_time: datetime) -> None:
+        audio = generate_same_test_audio(origin_time=origin_time)
+        position = 0
+        while not self.stop_event.is_set() and position < len(audio):
+            frame = audio[position : position + SILENCE_FRAME_SAMPLES]
+            if len(frame):
+                self._queue_audio(frame)
+            position += SILENCE_FRAME_SAMPLES
+            time.sleep(SILENCE_FRAME_SECONDS)
 
     def _produce_from_iq_stream(self, iq_socket: socket.socket) -> None:
         iq_stream = self.active_iq_stream
@@ -784,6 +920,19 @@ class StreamPipeline:
                 soundcard_worker.output.write(pcm)
             except Exception as exc:
                 soundcard_worker.error = exc
+        eas_worker = self.eas_recorder_worker
+        if eas_worker is not None:
+            try:
+                eas_worker.output.write(pcm)
+            except Exception as exc:
+                if eas_worker.error is None:
+                    LOG.warning("EAS recorder output failed; disabling recorder: %s", exc)
+                eas_worker.error = exc
+                self.eas_recorder_worker = None
+                try:
+                    eas_worker.output.close()
+                except Exception:
+                    pass
 
     def _mark_pcm_output(self) -> None:
         with self.state_lock:
@@ -929,7 +1078,16 @@ class StreamPipeline:
 
     def _audio_config(self) -> AudioConfig:
         with self.state_lock:
-            return self.audio
+            audio = self.audio
+        if not self.same_test:
+            return audio
+        return AudioConfig(
+            deemphasis=DeemphasisConfig(enabled=False),
+            volume=audio.volume,
+            highpass=audio.highpass,
+            lowpass=audio.lowpass,
+            notch=audio.notch,
+        )
 
     def _pending_receiver(self) -> tuple[CsdrServerConfig, int] | None:
         with self.state_lock:

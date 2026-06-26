@@ -4,6 +4,7 @@ import threading
 import time
 import unittest
 import queue
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import numpy as np
@@ -13,7 +14,9 @@ from rtl_weatherband.config import (
     AudioConfig,
     CsdrServerConfig,
     DeemphasisConfig,
+    EasRecordingConfig,
     FallbackConfig,
+    FilterConfig,
     IcecastConfig,
     SoundcardConfig,
     StationConfig,
@@ -27,12 +30,15 @@ from rtl_weatherband.pipeline import (
     SILENCE_FRAME,
     SILENCE_FRAME_SAMPLES,
     EncoderWorker,
+    EasRecorderWorker,
     FallbackPlaybackState,
     OutputWorker,
+    SAME_TEST_INTER_ALERT_SILENCE_FRAMES,
     SoundcardWorker,
     StreamPipeline,
     _next_fallback_frame,
 )
+from rtl_weatherband.eas_recording import _same_test_header, generate_same_test_audio
 from rtl_weatherband.soundcard import SoundcardError
 from rtl_weatherband.soundcard import SoundcardDependencyError
 
@@ -78,6 +84,24 @@ class FakeSoundcardOutput:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakeEasRecorderOutput:
+    def __init__(self, config: EasRecordingConfig) -> None:
+        self.config = config
+        self.frames: list[bytes] = []
+        self.closed = False
+
+    def write(self, pcm: bytes) -> None:
+        self.frames.append(pcm)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FailingEasRecorderOutput(FakeEasRecorderOutput):
+    def write(self, pcm: bytes) -> None:
+        raise RuntimeError("recorder failed")
 
 
 class FakeIqSocket:
@@ -331,6 +355,142 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(encoder_group.pcm_queue.get_nowait(), b"\x03\x00" * 320)
         self.assertEqual(soundcard_worker.output.frames, [b"\x03\x00" * 320])
 
+    def test_write_pcm_frame_fans_same_pcm_to_eas_recorder(self) -> None:
+        pipeline = self.make_pipeline()
+        eas_config = EasRecordingConfig(enabled=True)
+        eas_output = FakeEasRecorderOutput(eas_config)
+        pipeline.eas_recorder_worker = EasRecorderWorker(
+            config=eas_config,
+            output=eas_output,
+        )
+
+        pipeline._write_pcm_frame(b"\x03\x00" * 320)
+
+        self.assertEqual(eas_output.frames, [b"\x03\x00" * 320])
+
+    def test_eas_recorder_write_failure_does_not_stop_pipeline(self) -> None:
+        pipeline = self.make_pipeline()
+        eas_config = EasRecordingConfig(enabled=True)
+        eas_output = FailingEasRecorderOutput(eas_config)
+        pipeline.eas_recorder_worker = EasRecorderWorker(
+            config=eas_config,
+            output=eas_output,
+        )
+
+        pipeline._write_pcm_frame(b"\x03\x00" * 320)
+
+        self.assertIsNone(pipeline.eas_recorder_worker)
+        self.assertTrue(eas_output.closed)
+        self.assertIsNone(pipeline.poll_exit())
+
+    def test_same_test_audio_generator_produces_audio(self) -> None:
+        audio = generate_same_test_audio(
+            header="ZCZC-WXR-RWT-000000+0015-0010000-RTLWB-",
+        )
+
+        self.assertGreater(len(audio), 16000)
+        self.assertGreater(float(np.max(np.abs(audio))), 0.5)
+
+    def test_same_test_audio_uses_valid_dmo_header_and_packaged_message(self) -> None:
+        origin = datetime(2026, 6, 25, 20, 46, tzinfo=timezone.utc)
+        header = _same_test_header(origin)
+        audio = generate_same_test_audio(origin_time=origin)
+
+        self.assertEqual(header, "ZCZC-WXR-DMO-999999+0015-1762046-RTLWB000-")
+        self.assertEqual(len("RTLWB000"), 8)
+        self.assertGreater(len(audio), round(16000 * 25))
+        self.assertLessEqual(float(np.max(np.abs(audio))), 1.0)
+
+    def test_same_test_mode_disables_deemphasis_only(self) -> None:
+        pipeline = self.make_pipeline()
+        pipeline.same_test = True
+        pipeline.audio = AudioConfig(
+            deemphasis=DeemphasisConfig(enabled=True, tau=300),
+            volume=VolumeConfig(enabled=True, multiplier=1.5),
+            lowpass=FilterConfig(enabled=True, frequency=3000, sharpness=2),
+        )
+
+        audio = pipeline._audio_config()
+
+        self.assertFalse(audio.deemphasis.enabled)
+        self.assertTrue(audio.volume.enabled)
+        self.assertTrue(audio.lowpass.enabled)
+
+    def test_same_test_alert_is_queued_as_audio_frames(self) -> None:
+        pipeline = self.make_pipeline()
+
+        with patch("rtl_weatherband.pipeline.time.sleep"):
+            pipeline._play_same_test_alert(
+                datetime(2026, 6, 25, 20, 46, tzinfo=timezone.utc)
+            )
+
+        self.assertFalse(pipeline.pcm_queue.empty())
+
+    def test_same_test_alert_requests_are_generated_immediately_and_queued(self) -> None:
+        pipeline = self.make_pipeline()
+        first = np.full(SILENCE_FRAME_SAMPLES, 0.1, dtype=np.float32)
+        second = np.full(SILENCE_FRAME_SAMPLES, 0.2, dtype=np.float32)
+
+        with patch(
+            "rtl_weatherband.pipeline.generate_same_test_audio",
+            side_effect=[first, second],
+        ) as generate:
+            pipeline.request_same_test_alert()
+            pipeline.request_same_test_alert()
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertIs(pipeline._pop_same_test_alert(), first)
+        self.assertIs(pipeline._pop_same_test_alert(), second)
+
+    def test_same_test_producer_outputs_silence_between_alerts(self) -> None:
+        pipeline = self.make_pipeline()
+        times = [
+            datetime(2026, 6, 25, 20, 46, 30, tzinfo=timezone.utc),
+            datetime(2026, 6, 25, 20, 46, 30, tzinfo=timezone.utc),
+        ]
+
+        def sleep_once(_seconds: float) -> None:
+            pipeline.stop_event.set()
+
+        with patch("rtl_weatherband.pipeline.datetime") as datetime_class, patch(
+            "rtl_weatherband.pipeline.time.sleep",
+            side_effect=sleep_once,
+        ):
+            datetime_class.now.side_effect = times
+            pipeline._run_same_test_producer()
+
+        frame = pipeline.pcm_queue.get_nowait()
+        self.assertEqual(frame, np.zeros(SILENCE_FRAME_SAMPLES, dtype="<f4").tobytes())
+
+    def test_same_test_producer_inserts_silence_between_queued_alerts(self) -> None:
+        pipeline = self.make_pipeline()
+        first = np.full(SILENCE_FRAME_SAMPLES, 0.1, dtype=np.float32)
+        second = np.full(SILENCE_FRAME_SAMPLES, 0.2, dtype=np.float32)
+        pipeline.same_test_alerts.append(first)
+        pipeline.same_test_alerts.append(second)
+        sleep_calls = 0
+
+        def sleep_until_second_alert(_seconds: float) -> None:
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls >= SAME_TEST_INTER_ALERT_SILENCE_FRAMES + 2:
+                pipeline.stop_event.set()
+
+        with patch(
+            "rtl_weatherband.pipeline.time.sleep",
+            side_effect=sleep_until_second_alert,
+        ):
+            pipeline._run_same_test_producer()
+
+        frames = []
+        while not pipeline.pcm_queue.empty():
+            frames.append(np.frombuffer(pipeline.pcm_queue.get_nowait(), dtype="<f4"))
+
+        self.assertTrue(np.allclose(frames[0], first))
+        for frame in frames[1 : 1 + SAME_TEST_INTER_ALERT_SILENCE_FRAMES]:
+            self.assertTrue(np.allclose(frame, 0.0))
+        self.assertTrue(np.allclose(frames[1 + SAME_TEST_INTER_ALERT_SILENCE_FRAMES], second))
+
     def test_write_pcm_frame_fans_same_pcm_to_multiple_soundcards(self) -> None:
         pipeline = self.make_pipeline()
         first = SoundcardWorker(
@@ -432,6 +592,79 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(applied.csdr_server.buffer_seconds, 5)
         self.assertEqual(pipeline.csdr_server.buffer_seconds, 5)
         self.assertIsNone(pipeline.pending_receiver)
+
+    def test_eas_recording_reload_starts_recorder(self) -> None:
+        pipeline = self.make_pipeline()
+        eas_config = EasRecordingConfig(enabled=True, directory="/tmp/eas-alerts")
+        config = AppConfig(
+            csdr_server=pipeline.csdr_server,
+            station=StationConfig(frequency=pipeline.frequency_hz / 1_000_000),
+            icecast=pipeline.icecast,
+            audio=pipeline.audio,
+            fallback=pipeline.fallback,
+            eas_recording=eas_config,
+        )
+
+        with patch(
+            "rtl_weatherband.pipeline.EasRecorderOutput",
+            side_effect=lambda recorder_config: FakeEasRecorderOutput(recorder_config),
+        ):
+            applied = pipeline.apply_runtime_config(config)
+
+        self.assertEqual(applied.eas_recording, eas_config)
+        self.assertIsNotNone(pipeline.eas_recorder_worker)
+        assert pipeline.eas_recorder_worker is not None
+        self.assertEqual(pipeline.eas_recorder_worker.config, eas_config)
+        pipeline._stop_eas_recorder_worker(pipeline.eas_recorder_worker)
+        pipeline.eas_recorder_worker = None
+
+    def test_eas_recording_reload_failure_keeps_existing_recorder(self) -> None:
+        pipeline = self.make_pipeline()
+        old_config = EasRecordingConfig(enabled=True, directory="/tmp/old-alerts")
+        old_output = FakeEasRecorderOutput(old_config)
+        old_worker = EasRecorderWorker(config=old_config, output=old_output)
+        pipeline.eas_recording = old_config
+        pipeline.eas_recorder_worker = old_worker
+        new_config = AppConfig(
+            csdr_server=pipeline.csdr_server,
+            station=StationConfig(frequency=pipeline.frequency_hz / 1_000_000),
+            icecast=pipeline.icecast,
+            audio=pipeline.audio,
+            fallback=pipeline.fallback,
+            eas_recording=EasRecordingConfig(enabled=True, directory="/tmp/new-alerts"),
+        )
+
+        with patch(
+            "rtl_weatherband.pipeline.EasRecorderOutput",
+            side_effect=RuntimeError("multimon-ng missing"),
+        ):
+            applied = pipeline.apply_runtime_config(new_config)
+
+        self.assertEqual(applied.eas_recording, old_config)
+        self.assertIs(pipeline.eas_recorder_worker, old_worker)
+        self.assertFalse(old_output.closed)
+
+    def test_eas_recording_reload_can_disable_recorder(self) -> None:
+        pipeline = self.make_pipeline()
+        old_config = EasRecordingConfig(enabled=True, directory="/tmp/eas-alerts")
+        old_output = FakeEasRecorderOutput(old_config)
+        old_worker = EasRecorderWorker(config=old_config, output=old_output)
+        pipeline.eas_recording = old_config
+        pipeline.eas_recorder_worker = old_worker
+        new_config = AppConfig(
+            csdr_server=pipeline.csdr_server,
+            station=StationConfig(frequency=pipeline.frequency_hz / 1_000_000),
+            icecast=pipeline.icecast,
+            audio=pipeline.audio,
+            fallback=pipeline.fallback,
+            eas_recording=EasRecordingConfig(enabled=False),
+        )
+
+        applied = pipeline.apply_runtime_config(new_config)
+
+        self.assertFalse(applied.eas_recording.enabled)
+        self.assertIsNone(pipeline.eas_recorder_worker)
+        self.assertTrue(old_output.closed)
 
     def test_soundcard_reload_starts_local_output(self) -> None:
         pipeline = self.make_pipeline()

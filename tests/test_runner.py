@@ -11,11 +11,13 @@ from rtl_weatherband.config import (
     StationConfig,
 )
 from rtl_weatherband.runner import (
+    ReloadResult,
     _apply_icecast_reload,
     _connect_initial_icecast_outputs,
     _diff_icecast_destinations,
     _icecast_reload_plan,
     _retry_pending_icecast_reload,
+    _should_queue_same_test_alert,
     run,
 )
 from rtl_weatherband.soundcard import SoundcardDependencyError
@@ -188,6 +190,51 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(pipeline.args[1], (good,))
         self.assertEqual(pipeline.started_outputs, [good_sink])
         self.assertTrue(pipeline.stopped)
+
+    def test_same_test_noop_reload_queues_alert(self) -> None:
+        config = app_config(destination("/one.mp3"))
+
+        self.assertTrue(
+            _should_queue_same_test_alert(
+                True,
+                config,
+                ReloadResult(config, had_errors=False),
+            )
+        )
+
+    def test_same_test_changed_reload_does_not_queue_alert(self) -> None:
+        current = app_config(destination("/one.mp3"))
+        changed = app_config(destination("/two.mp3"))
+
+        self.assertFalse(
+            _should_queue_same_test_alert(
+                True,
+                current,
+                ReloadResult(changed, had_errors=False),
+            )
+        )
+
+    def test_same_test_invalid_reload_does_not_queue_alert(self) -> None:
+        config = app_config(destination("/one.mp3"))
+
+        self.assertFalse(
+            _should_queue_same_test_alert(
+                True,
+                config,
+                ReloadResult(config, had_errors=True),
+            )
+        )
+
+    def test_normal_noop_reload_does_not_queue_alert(self) -> None:
+        config = app_config(destination("/one.mp3"))
+
+        self.assertFalse(
+            _should_queue_same_test_alert(
+                False,
+                config,
+                ReloadResult(config, had_errors=False),
+            )
+        )
 
     def test_icecast_diff_keeps_unchanged_destination(self) -> None:
         first = destination("/one.mp3")

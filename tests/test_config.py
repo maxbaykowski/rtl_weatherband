@@ -63,6 +63,38 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.fallback.loop_delay_seconds, 0.0)
         self.assertIsNone(config.fallback.path)
         self.assertEqual(config.soundcard, ())
+        self.assertFalse(config.eas_recording.enabled)
+
+    def test_accepts_eas_recording_config(self) -> None:
+        raw = valid_config()
+        raw["eas_recording"] = {
+            "enabled": True,
+            "pre_seconds": 3,
+            "post_seconds": 4,
+            "max_seconds": 90,
+            "directory": "/tmp/eas-alerts",
+            "format": "mp3",
+            "local_time": True,
+        }
+
+        config = parse_config(raw)
+
+        self.assertTrue(config.eas_recording.enabled)
+        self.assertEqual(config.eas_recording.pre_seconds, 3)
+        self.assertEqual(config.eas_recording.post_seconds, 4)
+        self.assertEqual(config.eas_recording.max_seconds, 90)
+        self.assertEqual(config.eas_recording.directory, "/tmp/eas-alerts")
+        self.assertEqual(config.eas_recording.format, "mp3")
+        self.assertTrue(config.eas_recording.local_time)
+
+    def test_rejects_invalid_eas_recording_format(self) -> None:
+        raw = valid_config()
+        raw["eas_recording"] = {
+            "enabled": True,
+            "format": "ogg",
+        }
+        with self.assertRaisesRegex(ConfigError, "eas_recording.format"):
+            parse_config(raw)
 
     def test_accepts_s16_csdr_server_iq_format(self) -> None:
         raw = valid_config()
@@ -526,6 +558,24 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.soundcard, current.soundcard)
         self.assertTrue(any("soundcard:" in error for error in errors))
+
+    def test_reload_keeps_old_eas_recording_when_new_eas_recording_is_invalid(self) -> None:
+        current_raw = valid_config()
+        current_raw["eas_recording"] = {
+            "enabled": True,
+            "directory": "/tmp/eas-alerts",
+        }
+        current = parse_config(current_raw)
+        raw = valid_config()
+        raw["eas_recording"] = {
+            "enabled": True,
+            "format": "ogg",
+        }
+
+        config, errors = merge_valid_reload_config(raw, current)
+
+        self.assertEqual(config.eas_recording, current.eas_recording)
+        self.assertTrue(any("eas_recording:" in error for error in errors))
 
     def test_reload_can_disable_soundcard_section_with_outputs(self) -> None:
         current_raw = valid_config()
