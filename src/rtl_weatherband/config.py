@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +46,20 @@ PROTECTED_AUDIO_BANDS_HZ = (
     ("SAME mark tone", SAME_MARK_BAND_HZ),
 )
 AUDIO_NYQUIST_HZ = IQ_SAMPLE_RATE / 2
+STATE_DIRECTORY_NAME = "rtl_weatherband"
+ENV_VAR_PATTERN = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([^}]+)\})")
+
+
+def default_eas_recording_directory() -> str:
+    state_directory = os.environ.get("STATE_DIRECTORY")
+    if state_directory:
+        return str(Path(state_directory.split(":", 1)[0]).expanduser() / "alerts")
+    state_home = os.environ.get("XDG_STATE_HOME")
+    if state_home:
+        state_directory = Path(state_home).expanduser()
+    else:
+        state_directory = Path.home() / ".local" / "state"
+    return str(state_directory / STATE_DIRECTORY_NAME / "alerts")
 
 
 @dataclass(frozen=True)
@@ -145,7 +161,7 @@ class EasRecordingConfig:
     pre_seconds: float = 2.0
     post_seconds: float = 5.0
     max_seconds: int = 120
-    directory: str = "alerts"
+    directory: str = field(default_factory=default_eas_recording_directory)
     format: str = "wav"
     local_time: bool = False
 
@@ -499,15 +515,19 @@ def parse_eas_recording_config(raw: Any) -> EasRecordingConfig:
     if raw is None:
         return EasRecordingConfig()
     raw = _object(raw, "eas_recording")
+    enabled = _bool(raw, "enabled", False)
     max_seconds = raw.get("max_seconds", 120)
     if not isinstance(max_seconds, int) or isinstance(max_seconds, bool):
         raise ConfigError("eas_recording.max_seconds must be an integer")
+    directory = _str(raw, "directory", default_eas_recording_directory())
+    if enabled:
+        directory = _expand_eas_recording_directory(directory)
     return EasRecordingConfig(
-        enabled=_bool(raw, "enabled", False),
+        enabled=enabled,
         pre_seconds=float(raw.get("pre_seconds", 2.0)),
         post_seconds=float(raw.get("post_seconds", 5.0)),
         max_seconds=max_seconds,
-        directory=_str(raw, "directory", "alerts"),
+        directory=directory,
         format=_str(raw, "format", "wav").lower(),
         local_time=_bool(raw, "local_time", False),
     )
@@ -660,8 +680,16 @@ def validate_eas_recording_config(config: EasRecordingConfig) -> None:
     if config.format not in {"mp3", "wav"}:
         raise ConfigError("eas_recording.format must be either 'mp3' or 'wav'")
     directory = Path(config.directory).expanduser()
-    if directory.exists() and not directory.is_dir():
-        raise ConfigError("eas_recording.directory must be a directory")
+    try:
+        if directory.exists():
+            if not directory.is_dir():
+                raise ConfigError("eas_recording.directory must be a directory")
+        else:
+            directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConfigError(f"eas_recording.directory: {exc}") from exc
+    if not os.access(directory, os.R_OK | os.W_OK | os.X_OK):
+        raise ConfigError(f"eas_recording.directory is not writable: {directory}")
 
 
 def validate_buffer_config(
@@ -809,6 +837,25 @@ def _output_config_errors(config: IcecastConfig) -> list[str]:
                 f"{minimum} and {maximum} Kbps for Ogg Vorbis at {sample_rate} Hz"
             )
     return errors
+
+
+def _expand_eas_recording_directory(path: str) -> str:
+    missing = []
+    invalid = []
+    for match in ENV_VAR_PATTERN.finditer(path):
+        name = match.group(1) or match.group(2) or ""
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            invalid.append(name)
+        elif not os.environ.get(name):
+            missing.append(name)
+    if invalid:
+        names = ", ".join(sorted(set(invalid)))
+        raise ConfigError(f"eas_recording.directory has invalid environment variable: {names}")
+    if missing:
+        names = ", ".join(sorted(set(missing)))
+        raise ConfigError(f"eas_recording.directory environment variable is not set: {names}")
+    expanded = os.path.expandvars(path)
+    return str(Path(expanded).expanduser())
 
 
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:

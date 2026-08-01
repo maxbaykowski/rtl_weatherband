@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 import wave
+from pathlib import Path
+from unittest.mock import patch
 
 from rtl_weatherband.config import ConfigError, merge_valid_reload_config, parse_config
 
@@ -86,6 +89,89 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.eas_recording.directory, "/tmp/eas-alerts")
         self.assertEqual(config.eas_recording.format, "mp3")
         self.assertTrue(config.eas_recording.local_time)
+
+    def test_eas_recording_defaults_to_state_directory(self) -> None:
+        raw = valid_config()
+        raw["eas_recording"] = {
+            "enabled": True,
+        }
+        with tempfile.TemporaryDirectory() as state_home:
+            expected = Path(state_home) / "rtl_weatherband" / "alerts"
+            with patch.dict(os.environ, {"XDG_STATE_HOME": state_home}):
+                config = parse_config(raw)
+
+            self.assertEqual(config.eas_recording.directory, str(expected))
+            self.assertTrue(expected.is_dir())
+
+    def test_eas_recording_defaults_to_systemd_state_directory(self) -> None:
+        raw = valid_config()
+        raw["eas_recording"] = {
+            "enabled": True,
+        }
+        with tempfile.TemporaryDirectory() as state_directory:
+            expected = Path(state_directory) / "alerts"
+            with patch.dict(
+                os.environ,
+                {"STATE_DIRECTORY": state_directory},
+                clear=False,
+            ):
+                config = parse_config(raw)
+
+            self.assertEqual(config.eas_recording.directory, str(expected))
+            self.assertTrue(expected.is_dir())
+
+    def test_expands_eas_recording_directory_environment_variables(self) -> None:
+        raw = valid_config()
+        raw["eas_recording"] = {
+            "enabled": True,
+            "directory": "${STATE_DIRECTORY}/alerts",
+        }
+        with tempfile.TemporaryDirectory() as state_directory:
+            expected = Path(state_directory) / "alerts"
+            with patch.dict(
+                os.environ,
+                {"STATE_DIRECTORY": state_directory},
+                clear=False,
+            ):
+                config = parse_config(raw)
+
+            self.assertEqual(config.eas_recording.directory, str(expected))
+            self.assertTrue(expected.is_dir())
+
+    def test_rejects_missing_eas_recording_directory_environment_variable(self) -> None:
+        raw = valid_config()
+        raw["eas_recording"] = {
+            "enabled": True,
+            "directory": "$RTL_WEATHERBAND_MISSING_STATE/alerts",
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ConfigError, "environment variable is not set"):
+                parse_config(raw)
+
+    def test_rejects_empty_eas_recording_directory_environment_variable(self) -> None:
+        raw = valid_config()
+        raw["eas_recording"] = {
+            "enabled": True,
+            "directory": "$STATE_DIRECTORY/alerts",
+        }
+        with patch.dict(os.environ, {"STATE_DIRECTORY": ""}, clear=True):
+            with self.assertRaisesRegex(ConfigError, "environment variable is not set"):
+                parse_config(raw)
+
+    def test_disabled_eas_recording_does_not_expand_directory_variables(self) -> None:
+        raw = valid_config()
+        raw["eas_recording"] = {
+            "enabled": False,
+            "directory": "$RTL_WEATHERBAND_MISSING_STATE/alerts",
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            config = parse_config(raw)
+
+        self.assertFalse(config.eas_recording.enabled)
+        self.assertEqual(
+            config.eas_recording.directory,
+            "$RTL_WEATHERBAND_MISSING_STATE/alerts",
+        )
 
     def test_rejects_invalid_eas_recording_format(self) -> None:
         raw = valid_config()
@@ -576,6 +662,52 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.eas_recording, current.eas_recording)
         self.assertTrue(any("eas_recording:" in error for error in errors))
+
+    def test_reload_keeps_old_eas_recording_when_directory_variable_is_missing(self) -> None:
+        current_raw = valid_config()
+        current_raw["eas_recording"] = {
+            "enabled": True,
+            "directory": "/tmp/eas-alerts",
+        }
+        current = parse_config(current_raw)
+        raw = valid_config()
+        raw["eas_recording"] = {
+            "enabled": True,
+            "directory": "$RTL_WEATHERBAND_MISSING_STATE/alerts",
+        }
+
+        with patch.dict(os.environ, {}, clear=True):
+            config, errors = merge_valid_reload_config(raw, current)
+
+        self.assertEqual(config.eas_recording, current.eas_recording)
+        self.assertTrue(any("eas_recording:" in error for error in errors))
+
+    def test_reload_reevaluates_eas_recording_directory_environment_variables(self) -> None:
+        raw = valid_config()
+        raw["eas_recording"] = {
+            "enabled": True,
+            "directory": "$STATE_DIRECTORY/alerts",
+        }
+        with tempfile.TemporaryDirectory() as old_state_directory:
+            with patch.dict(
+                os.environ,
+                {"STATE_DIRECTORY": old_state_directory},
+                clear=False,
+            ):
+                current = parse_config(raw)
+
+        with tempfile.TemporaryDirectory() as new_state_directory:
+            expected = Path(new_state_directory) / "alerts"
+            with patch.dict(
+                os.environ,
+                {"STATE_DIRECTORY": new_state_directory},
+                clear=False,
+            ):
+                config, errors = merge_valid_reload_config(raw, current)
+
+            self.assertFalse(errors)
+            self.assertEqual(config.eas_recording.directory, str(expected))
+            self.assertNotEqual(config.eas_recording, current.eas_recording)
 
     def test_reload_can_disable_soundcard_section_with_outputs(self) -> None:
         current_raw = valid_config()

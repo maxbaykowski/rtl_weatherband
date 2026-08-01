@@ -112,8 +112,13 @@ Keep as "f32" unless you're connecting to a csdr_server instance on LAN or WAN.
     post_seconds: 5,
     // Maximum recording length for a single alert, in seconds.
     max_seconds: 120,
-    // Directory where alert recordings and index.json will be saved.
-    directory: "./alerts",
+    /*
+    Directory where alert recordings and index.json will be saved.
+    Environment variables are supported here, for example "$STATE_DIRECTORY/alerts".
+    Leave unset to use $STATE_DIRECTORY/alerts when systemd provides it,
+    then $XDG_STATE_HOME/rtl_weatherband/alerts, or ~/.local/state/rtl_weatherband/alerts.
+    */
+    // directory: "$STATE_DIRECTORY/alerts",
     // Recording format: "wav" or "mp3".
     format: "wav",
     // Use local time in generated filenames instead of UTC.
