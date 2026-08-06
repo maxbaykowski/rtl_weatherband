@@ -161,7 +161,7 @@ class EasRecordingConfig:
     pre_seconds: float = 2.0
     post_seconds: float = 5.0
     max_seconds: int = 120
-    directory: str = field(default_factory=default_eas_recording_directory)
+    directory: str = ""
     format: str = "wav"
     local_time: bool = False
 
@@ -293,14 +293,14 @@ def parse_csdr_server_config(raw: dict[str, Any]) -> CsdrServerConfig:
     return CsdrServerConfig(
         host=_str(raw, "host"),
         port=_int(raw, "port"),
-        timeout=float(raw.get("timeout", 10.0)),
+        timeout=_float(raw, "timeout", 10.0),
         iq_format=_str(raw, "iq_format", "f32").lower(),
-        buffer_seconds=float(raw.get("buffer_seconds", 1.0)),
+        buffer_seconds=_float(raw, "buffer_seconds", 1.0),
     )
 
 
 def parse_station_config(raw: dict[str, Any]) -> StationConfig:
-    return StationConfig(frequency=float(raw["frequency"]))
+    return StationConfig(frequency=_float(raw, "frequency"))
 
 
 def parse_icecast_config(raw: dict[str, Any]) -> IcecastConfig:
@@ -438,7 +438,7 @@ def parse_deemphasis_config(raw: Any) -> DeemphasisConfig:
     raw = _object(raw, "audio.deemphasis")
     return DeemphasisConfig(
         enabled=_bool(raw, "enabled", True),
-        tau=float(raw.get("tau", 530.0)),
+        tau=_float(raw, "tau", 530.0),
     )
 
 
@@ -448,7 +448,7 @@ def parse_volume_config(raw: Any) -> VolumeConfig:
     raw = _object(raw, "audio.volume")
     return VolumeConfig(
         enabled=_bool(raw, "enabled", False),
-        multiplier=float(raw.get("multiplier", 1.0)),
+        multiplier=_float(raw, "multiplier", 1.0),
     )
 
 
@@ -458,8 +458,8 @@ def parse_filter_config(raw: Any) -> FilterConfig:
     raw = _object(raw, "audio filter")
     return FilterConfig(
         enabled=_bool(raw, "enabled", False),
-        frequency=float(raw.get("frequency", 0.0)),
-        sharpness=float(raw.get("sharpness", 0.0)),
+        frequency=_float(raw, "frequency", 0.0),
+        sharpness=_float(raw, "sharpness", 0.0),
     )
 
 
@@ -468,13 +468,12 @@ def parse_fallback_config(raw: Any) -> FallbackConfig:
         return FallbackConfig()
     raw = _object(raw, "fallback")
     return FallbackConfig(
-        silence_timeout_seconds=float(
-            raw.get(
-                "silence_timeout_seconds",
-                raw.get("silence_allowed_seconds", 30.0),
-            )
+        silence_timeout_seconds=_float(
+            raw,
+            "silence_timeout_seconds",
+            raw.get("silence_allowed_seconds", 30.0),
         ),
-        loop_delay_seconds=float(raw.get("loop_delay_seconds", 0.0)),
+        loop_delay_seconds=_float(raw, "loop_delay_seconds", 0.0),
         path=_optional_str(raw, "path"),
     )
 
@@ -519,13 +518,18 @@ def parse_eas_recording_config(raw: Any) -> EasRecordingConfig:
     max_seconds = raw.get("max_seconds", 120)
     if not isinstance(max_seconds, int) or isinstance(max_seconds, bool):
         raise ConfigError("eas_recording.max_seconds must be an integer")
-    directory = _str(raw, "directory", default_eas_recording_directory())
+    if "directory" in raw:
+        directory = _str(raw, "directory")
+    elif enabled:
+        directory = default_eas_recording_directory()
+    else:
+        directory = ""
     if enabled:
         directory = _expand_eas_recording_directory(directory)
     return EasRecordingConfig(
         enabled=enabled,
-        pre_seconds=float(raw.get("pre_seconds", 2.0)),
-        post_seconds=float(raw.get("post_seconds", 5.0)),
+        pre_seconds=_float(raw, "pre_seconds", 2.0),
+        post_seconds=_float(raw, "post_seconds", 5.0),
         max_seconds=max_seconds,
         directory=directory,
         format=_str(raw, "format", "wav").lower(),
@@ -850,10 +854,14 @@ def _expand_eas_recording_directory(path: str) -> str:
             missing.append(name)
     if invalid:
         names = ", ".join(sorted(set(invalid)))
-        raise ConfigError(f"eas_recording.directory has invalid environment variable: {names}")
+        raise ConfigError(
+            f"eas_recording.directory has invalid environment variable: {names}"
+        )
     if missing:
         names = ", ".join(sorted(set(missing)))
-        raise ConfigError(f"eas_recording.directory environment variable is not set: {names}")
+        raise ConfigError(
+            f"eas_recording.directory environment variable is not set: {names}"
+        )
     expanded = os.path.expandvars(path)
     return str(Path(expanded).expanduser())
 
@@ -889,14 +897,14 @@ def _optional_str(raw: dict[str, Any], key: str) -> str | None:
 
 def _int(raw: dict[str, Any], key: str) -> int:
     value = raw.get(key)
-    if not isinstance(value, int):
+    if not isinstance(value, int) or isinstance(value, bool):
         raise ConfigError(f"{key} must be an integer")
     return value
 
 
-def _float(raw: dict[str, Any], key: str) -> float:
-    value = raw.get(key)
-    if not isinstance(value, (int, float)):
+def _float(raw: dict[str, Any], key: str, default: float | int | None = None) -> float:
+    value = raw.get(key, default)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ConfigError(f"{key} must be a number")
     return float(value)
 

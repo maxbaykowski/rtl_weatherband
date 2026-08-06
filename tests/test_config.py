@@ -67,6 +67,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(config.fallback.path)
         self.assertEqual(config.soundcard, ())
         self.assertFalse(config.eas_recording.enabled)
+        self.assertEqual(config.eas_recording.directory, "")
 
     def test_accepts_eas_recording_config(self) -> None:
         raw = valid_config()
@@ -173,6 +174,27 @@ class ConfigTests(unittest.TestCase):
             "$RTL_WEATHERBAND_MISSING_STATE/alerts",
         )
 
+    def test_absent_disabled_eas_recording_does_not_capture_environment_variables(self) -> None:
+        raw = valid_config()
+        with tempfile.TemporaryDirectory() as first_state_directory:
+            with patch.dict(
+                os.environ,
+                {"STATE_DIRECTORY": first_state_directory},
+                clear=False,
+            ):
+                first = parse_config(raw)
+
+        with tempfile.TemporaryDirectory() as second_state_directory:
+            with patch.dict(
+                os.environ,
+                {"STATE_DIRECTORY": second_state_directory},
+                clear=False,
+            ):
+                second = parse_config(raw)
+
+        self.assertEqual(first.eas_recording, second.eas_recording)
+        self.assertEqual(first.eas_recording.directory, "")
+
     def test_rejects_invalid_eas_recording_format(self) -> None:
         raw = valid_config()
         raw["eas_recording"] = {
@@ -199,6 +221,36 @@ class ConfigTests(unittest.TestCase):
         raw["csdr_server"]["timeout"] = 0
         with self.assertRaisesRegex(ConfigError, "timeout"):
             parse_config(raw)
+
+    def test_rejects_boolean_numeric_values(self) -> None:
+        cases = [
+            ("station frequency", ("station", "frequency")),
+            ("csdr_server timeout", ("csdr_server", "timeout")),
+            ("icecast port", ("icecast", "port")),
+            ("icecast sample_rate", ("icecast", "sample_rate")),
+            ("fallback timeout", ("fallback", "silence_timeout_seconds")),
+            ("audio volume", ("audio", "volume", "multiplier")),
+            ("EAS pre_seconds", ("eas_recording", "pre_seconds")),
+        ]
+        for label, path in cases:
+            with self.subTest(label=label):
+                raw = valid_config()
+                if path[0] == "fallback":
+                    raw["fallback"] = {}
+                if path[0] == "audio" and path[1] == "volume":
+                    raw["audio"]["volume"] = {"enabled": True}
+                if path[0] == "eas_recording":
+                    raw["eas_recording"] = {
+                        "enabled": True,
+                        "directory": "/tmp/eas-alerts",
+                    }
+                section = raw
+                for key in path[:-1]:
+                    section = section[key]
+                section[path[-1]] = True
+
+                with self.assertRaises(ConfigError):
+                    parse_config(raw)
 
     def test_accepts_csdr_server_buffer_seconds(self) -> None:
         raw = valid_config()

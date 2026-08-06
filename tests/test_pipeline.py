@@ -285,6 +285,53 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(encoder_group.stop_event.is_set())
         encoder_group.stop_event.set()
 
+    def test_icecast_reload_encoder_creation_failure_keeps_existing_output(self) -> None:
+        pipeline = self.make_pipeline()
+        old_config = pipeline.icecast[0]
+        new_config = IcecastConfig(
+            host="127.0.0.1",
+            port=8000,
+            mount="/new.mp3",
+            username="source",
+            password="hackme",
+            format="ogg",
+            sample_rate=22050,
+            bitrate=32,
+        )
+        old_encoder_group = EncoderWorker(
+            key=("mp3", 16000, 32),
+            config=old_config,
+            encoder=FakeEncoder(),
+            pcm_queue=queue.Queue(),
+            stop_event=threading.Event(),
+            thread=threading.Thread(),
+        )
+        old_output = OutputWorker(
+            config=old_config,
+            encoder_group=old_encoder_group,
+            encoded_queue=queue.Queue(),
+            stop_event=threading.Event(),
+            thread=threading.Thread(),
+        )
+        old_encoder_group.outputs.append(old_output)
+        pipeline.encoder_groups = [old_encoder_group]
+        pipeline.outputs = [old_output]
+
+        with patch(
+            "rtl_weatherband.pipeline.create_audio_encoder",
+            side_effect=RuntimeError("encoder unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "encoder unavailable"):
+                pipeline.apply_icecast_outputs(
+                    (new_config,),
+                    [old_config],
+                    [(new_config, PcmSink())],
+                )
+
+        self.assertEqual(pipeline.outputs, [old_output])
+        self.assertFalse(old_output.stop_event.is_set())
+        self.assertEqual(old_encoder_group.outputs, [old_output])
+
     def test_idle_frame_uses_silence_before_fallback_timeout(self) -> None:
         pipeline = self.make_pipeline()
         pipeline.fallback = FallbackConfig(silence_timeout_seconds=30)
@@ -592,6 +639,28 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(applied.csdr_server.buffer_seconds, 5)
         self.assertEqual(pipeline.csdr_server.buffer_seconds, 5)
         self.assertIsNone(pipeline.pending_receiver)
+
+    def test_hotswap_preserves_iq_probe_bytes(self) -> None:
+        pipeline = self.make_pipeline()
+        receiver = (
+            CsdrServerConfig(host="127.0.0.1", port=4952),
+            pipeline.frequency_hz,
+        )
+        replacement = IqStream(FakeIqSocket(b""), FakeIqSocket(b""), {})
+        probe = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+        pipeline.pending_receiver = receiver
+
+        with patch(
+            "rtl_weatherband.pipeline.open_iq_stream",
+            return_value=replacement,
+        ), patch.object(
+            pipeline,
+            "_read_hotswap_iq_probe",
+            return_value=probe,
+        ):
+            pipeline._connect_hotswap_iq_stream(receiver)
+
+        self.assertEqual(pipeline.hotswap_result, (receiver, replacement, probe))
 
     def test_eas_recording_reload_starts_recorder(self) -> None:
         pipeline = self.make_pipeline()

@@ -267,13 +267,25 @@ class StreamPipeline:
             [_icecast_label(config) for config, _ in additions],
             stop_unused_encoders,
         )
+        new_outputs: list[OutputWorker] = []
+        try:
+            for config, encoded_output in additions:
+                output = self._create_output_worker(config, encoded_output)
+                new_outputs.append(output)
+        except Exception:
+            for output in new_outputs:
+                with output.encoder_group.lock:
+                    if output in output.encoder_group.outputs:
+                        output.encoder_group.outputs.remove(output)
+            self._stop_unused_encoder_workers()
+            raise
+
         for config in remove_configs:
             self._remove_output(config)
-        for config, encoded_output in additions:
-            output = self._create_output_worker(config, encoded_output)
+        for output in new_outputs:
             self.outputs.append(output)
             output.thread.start()
-            LOG.info("started Icecast writer for %s", _icecast_label(config))
+            LOG.info("started Icecast writer for %s", _icecast_label(output.config))
         if stop_unused_encoders:
             self._stop_unused_encoder_workers()
         self.icecast = icecast
@@ -771,7 +783,7 @@ class StreamPipeline:
         csdr_server, frequency_hz = receiver
         try:
             replacement = open_iq_stream(csdr_server, frequency_hz)
-            self._read_hotswap_iq_probe(replacement, csdr_server.timeout)
+            probe = self._read_hotswap_iq_probe(replacement, csdr_server.timeout)
         except Exception as exc:
             LOG.warning(
                 "csdr_server hotswap to %s:%s failed: %s; keeping current stream",
@@ -785,7 +797,7 @@ class StreamPipeline:
                 close_replacement = True
             else:
                 close_replacement = False
-                self.hotswap_result = (receiver, replacement, b"")
+                self.hotswap_result = (receiver, replacement, probe)
         if close_replacement:
             replacement.close()
 
