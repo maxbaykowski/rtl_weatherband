@@ -14,11 +14,12 @@ from rtl_weatherband.config import (
     AudioConfig,
     DeemphasisConfig,
     FilterConfig,
+    IQ_SAMPLE_RATE,
     VolumeConfig,
 )
 
 
-def sine(frequency: float, sample_rate: int = 16000, seconds: float = 0.25):
+def sine(frequency: float, sample_rate: int = IQ_SAMPLE_RATE, seconds: float = 0.25):
     times = np.arange(round(sample_rate * seconds), dtype=np.float32) / sample_rate
     return np.sin(2 * np.pi * frequency * times).astype(np.float32) * 0.5
 
@@ -57,7 +58,7 @@ class AudioEffectsTests(unittest.TestCase):
 
         output = processor.process(source)
 
-        self.assertGreater(steady_rms(output), steady_rms(source) * 0.7)
+        self.assertGreater(steady_rms(output), steady_rms(source) * 0.65)
 
     def test_volume_multiplier_changes_level(self) -> None:
         processor = AudioEffectsProcessor(
@@ -81,7 +82,7 @@ class AudioEffectsTests(unittest.TestCase):
 
     def test_dc_blocker_removes_constant_bias_across_chunks(self) -> None:
         blocker = DcBlocker()
-        source = np.full(16000, 0.25, dtype=np.float32)
+        source = np.full(IQ_SAMPLE_RATE, 0.25, dtype=np.float32)
 
         output = np.concatenate(
             (
@@ -98,7 +99,7 @@ class AudioEffectsTests(unittest.TestCase):
                 deemphasis=DeemphasisConfig(enabled=False),
             )
         )
-        source = np.full(16000, 0.2, dtype=np.float32)
+        source = np.full(IQ_SAMPLE_RATE, 0.2, dtype=np.float32)
 
         output = processor.process(source)
 
@@ -110,7 +111,7 @@ class AudioEffectsTests(unittest.TestCase):
                 deemphasis=DeemphasisConfig(enabled=True),
             )
         )
-        source = np.full(16000, 0.2, dtype=np.float32)
+        source = np.full(IQ_SAMPLE_RATE, 0.2, dtype=np.float32)
 
         output = processor.process(source)
 

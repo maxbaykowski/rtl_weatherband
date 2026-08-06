@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 
 
 PCM_SCALE = 32768.0
+NFM_DEVIATION_GAIN = 1.5
 
 
 @dataclass
@@ -39,7 +40,10 @@ class NfmDemodulator:
 
         self._previous_sample = iq[-1]
         demodulated = np.angle(current * np.conj(previous)).astype(np.float32)
-        return demodulated / np.pi
+        return (demodulated / np.pi * NFM_DEVIATION_GAIN).astype(
+            np.float32,
+            copy=False,
+        )
 
 
 def _iq_bytes_to_complex64(chunk: bytes, iq_format: str) -> NDArray[np.complex64]:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 import threading
 import time
 import unittest
@@ -18,6 +20,7 @@ from rtl_weatherband.config import (
     FallbackConfig,
     FilterConfig,
     IcecastConfig,
+    IQ_SAMPLE_RATE,
     SoundcardConfig,
     StationConfig,
     VolumeConfig,
@@ -28,6 +31,7 @@ from rtl_weatherband.pipeline import (
     AUDIO_FRAME_BYTES,
     PCM_FRAME_BYTES,
     SILENCE_FRAME,
+    SILENCE_FRAME_SECONDS,
     SILENCE_FRAME_SAMPLES,
     EncoderWorker,
     EasRecorderWorker,
@@ -114,29 +118,73 @@ class FakeIqSocket:
         return payload
 
 
+class FakeSoxrResampleStream:
+    def __init__(
+        self,
+        input_rate: int,
+        output_rate: int,
+        _channels: int,
+        *,
+        dtype: str,
+    ) -> None:
+        self.input_rate = input_rate
+        self.output_rate = output_rate
+
+    def resample_chunk(self, samples, last=False):
+        if len(samples) == 0:
+            return samples
+        output_count = max(1, round(len(samples) * self.output_rate / self.input_rate))
+        positions = np.linspace(0, len(samples) - 1, output_count)
+        return np.interp(positions, np.arange(len(samples)), samples).astype(samples.dtype)
+
+
 def audio_frame(value: float) -> bytes:
     return np.full(SILENCE_FRAME_SAMPLES, value, dtype="<f4").tobytes()
 
 
 class PipelineTests(unittest.TestCase):
-    def make_pipeline(self) -> StreamPipeline:
-        return StreamPipeline(
-            AudioConfig(),
-            (
-                IcecastConfig(
-                    host="127.0.0.1",
-                    port=8000,
-                    mount="/nwr.mp3",
-                    username="source",
-                    password="hackme",
-                    format="mp3",
-                    sample_rate=16000,
-                    bitrate=32,
-                ),
-            ),
-            CsdrServerConfig(host="127.0.0.1", port=4951),
-            162_550_000,
+    def setUp(self) -> None:
+        self.soxr_patch = patch.dict(
+            sys.modules,
+            {
+                "soxr": types.SimpleNamespace(
+                    ResampleStream=FakeSoxrResampleStream,
+                )
+            },
         )
+        self.soxr_patch.start()
+
+    def tearDown(self) -> None:
+        self.soxr_patch.stop()
+
+    def make_pipeline(self) -> StreamPipeline:
+        fallback_audio = FallbackAudio(
+            sample_rate=IQ_SAMPLE_RATE,
+            pcm=b"\x00\x00" * SILENCE_FRAME_SAMPLES,
+            duration_seconds=SILENCE_FRAME_SECONDS,
+            source="test fallback",
+        )
+        with patch(
+            "rtl_weatherband.pipeline.load_fallback_audio",
+            return_value=fallback_audio,
+        ):
+            return StreamPipeline(
+                AudioConfig(),
+                (
+                    IcecastConfig(
+                        host="127.0.0.1",
+                        port=8000,
+                        mount="/nwr.mp3",
+                        username="source",
+                        password="hackme",
+                        format="mp3",
+                        sample_rate=16000,
+                        bitrate=32,
+                    ),
+                ),
+                CsdrServerConfig(host="127.0.0.1", port=4951),
+                162_550_000,
+            )
 
     def app_config(self, pipeline: StreamPipeline, fallback: FallbackConfig) -> AppConfig:
         return AppConfig(
@@ -337,7 +385,7 @@ class PipelineTests(unittest.TestCase):
         pipeline.fallback = FallbackConfig(silence_timeout_seconds=30)
         pipeline.fallback_audio = FallbackAudio(
             sample_rate=16000,
-            pcm=b"\x01\x00" * 320,
+            pcm=b"\x01\x00" * SILENCE_FRAME_SAMPLES,
             duration_seconds=0.02,
             source="test",
         )
@@ -360,7 +408,7 @@ class PipelineTests(unittest.TestCase):
 
         frame = pipeline._idle_pcm_frame()
 
-        self.assertEqual(frame, b"\x01\x00" * 320)
+        self.assertEqual(frame, b"\x01\x00" * SILENCE_FRAME_SAMPLES)
         self.assertTrue(pipeline.fallback_state.active)
 
     def test_queued_audio_does_not_reset_fallback_state(self) -> None:
@@ -435,7 +483,7 @@ class PipelineTests(unittest.TestCase):
             header="ZCZC-WXR-RWT-000000+0015-0010000-RTLWB-",
         )
 
-        self.assertGreater(len(audio), 16000)
+        self.assertGreater(len(audio), IQ_SAMPLE_RATE)
         self.assertGreater(float(np.max(np.abs(audio))), 0.5)
 
     def test_same_test_audio_uses_valid_dmo_header_and_packaged_message(self) -> None:
@@ -445,7 +493,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(header, "ZCZC-WXR-DMO-999999+0015-1762046-RTLWB000-")
         self.assertEqual(len("RTLWB000"), 8)
-        self.assertGreater(len(audio), round(16000 * 25))
+        self.assertGreater(len(audio), round(IQ_SAMPLE_RATE * 25))
         self.assertLessEqual(float(np.max(np.abs(audio))), 1.0)
 
     def test_same_test_mode_disables_deemphasis_only(self) -> None:
@@ -1012,7 +1060,7 @@ class PipelineTests(unittest.TestCase):
             thread=threading.Thread(),
         )
         pipeline.encoder_groups.append(encoder_group)
-        times = np.arange(SILENCE_FRAME_SAMPLES, dtype=np.float32) / 16000
+        times = np.arange(SILENCE_FRAME_SAMPLES, dtype=np.float32) / IQ_SAMPLE_RATE
         source = (np.sin(2 * np.pi * 1000 * times) * 0.25).astype(np.float32)
         pipeline._queue_audio(source)
 
@@ -1045,19 +1093,23 @@ class PipelineTests(unittest.TestCase):
         pipeline = self.make_pipeline()
         pipeline.fallback = FallbackConfig(silence_timeout_seconds=120)
         pipeline.fallback_audio = FallbackAudio(
-            sample_rate=16000,
-            pcm=b"\x01\x00" * 320,
+            sample_rate=IQ_SAMPLE_RATE,
+            pcm=b"\x01\x00" * SILENCE_FRAME_SAMPLES,
             duration_seconds=0.02,
             source="test",
         )
         pipeline.last_pcm_at = time.monotonic() - 45
 
-        pipeline.apply_runtime_config(
-            self.app_config(
-                pipeline,
-                FallbackConfig(silence_timeout_seconds=30),
+        with patch(
+            "rtl_weatherband.pipeline.load_fallback_audio",
+            return_value=pipeline.fallback_audio,
+        ):
+            pipeline.apply_runtime_config(
+                self.app_config(
+                    pipeline,
+                    FallbackConfig(silence_timeout_seconds=30),
+                )
             )
-        )
         frame = pipeline._idle_pcm_frame()
 
         self.assertEqual(len(frame), len(SILENCE_FRAME))
@@ -1067,21 +1119,25 @@ class PipelineTests(unittest.TestCase):
         pipeline = self.make_pipeline()
         pipeline.fallback = FallbackConfig(silence_timeout_seconds=30)
         pipeline.fallback_audio = FallbackAudio(
-            sample_rate=16000,
-            pcm=b"\x01\x00" * 320,
-            duration_seconds=0.02,
+            sample_rate=IQ_SAMPLE_RATE,
+            pcm=b"\x01\x00" * (SILENCE_FRAME_SAMPLES * 2),
+            duration_seconds=0.04,
             source="test",
         )
         pipeline.last_pcm_at = time.monotonic() - 60
         pipeline.fallback_state.active = True
         pipeline.fallback_state.position = 4
 
-        pipeline.apply_runtime_config(
-            self.app_config(
-                pipeline,
-                FallbackConfig(silence_timeout_seconds=120, loop_delay_seconds=1),
+        with patch(
+            "rtl_weatherband.pipeline.load_fallback_audio",
+            return_value=pipeline.fallback_audio,
+        ):
+            pipeline.apply_runtime_config(
+                self.app_config(
+                    pipeline,
+                    FallbackConfig(silence_timeout_seconds=120, loop_delay_seconds=1),
+                )
             )
-        )
         frame = pipeline._idle_pcm_frame()
 
         self.assertTrue(pipeline.fallback_state.active)
@@ -1091,7 +1147,7 @@ class PipelineTests(unittest.TestCase):
     def test_fallback_loop_delay_controls_restart_gap(self) -> None:
         audio = FallbackAudio(
             sample_rate=16000,
-            pcm=b"\x01\x00" * 160,
+            pcm=b"\x01\x00" * (SILENCE_FRAME_SAMPLES // 2),
             duration_seconds=0.01,
             source="test",
         )
@@ -1100,8 +1156,12 @@ class PipelineTests(unittest.TestCase):
         delayed_state = FallbackPlaybackState()
         delayed = _next_fallback_frame(audio, delayed_state, 0.01)
 
-        self.assertEqual(no_delay, b"\x01\x00" * 320)
-        self.assertEqual(delayed, b"\x01\x00" * 160 + b"\x00\x00" * 160)
+        self.assertEqual(no_delay, b"\x01\x00" * SILENCE_FRAME_SAMPLES)
+        self.assertEqual(
+            delayed,
+            b"\x01\x00" * (SILENCE_FRAME_SAMPLES // 2)
+            + b"\x00\x00" * (SILENCE_FRAME_SAMPLES // 2),
+        )
 
 
 if __name__ == "__main__":

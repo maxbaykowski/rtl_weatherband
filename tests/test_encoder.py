@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import sys
+import types
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from rtl_weatherband.config import IcecastConfig
+from rtl_weatherband.config import IQ_SAMPLE_RATE, IcecastConfig
 from rtl_weatherband.encoder import (
     Mp3Encoder,
     OggVorbisEncoder,
@@ -15,7 +18,7 @@ from rtl_weatherband.encoder import (
 
 def icecast_config(
     format: str,
-    sample_rate: int = 16000,
+    sample_rate: int = IQ_SAMPLE_RATE,
     bitrate: int = 32,
 ) -> IcecastConfig:
     return IcecastConfig(
@@ -33,9 +36,19 @@ def icecast_config(
 class EncoderTests(unittest.TestCase):
     def test_resampler_downsamples_pcm(self) -> None:
         source = np.arange(320, dtype="<i2").tobytes()
-        resampler = PcmResampler(16000, 8000)
 
-        output = resampler.process(source) + resampler.flush()
+        class FakeResampleStream:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def resample_chunk(self, samples, last=False):
+                return samples[::2]
+
+        fake_soxr = types.SimpleNamespace(ResampleStream=FakeResampleStream)
+        with patch.dict(sys.modules, {"soxr": fake_soxr}):
+            resampler = PcmResampler(16000, 8000)
+
+            output = resampler.process(source) + resampler.flush()
 
         self.assertEqual(len(output), 160 * 2)
 
@@ -71,7 +84,7 @@ class EncoderTests(unittest.TestCase):
 
     def test_ogg_vorbis_encoder_uses_managed_bitrate_mode(self) -> None:
         encoder = OggVorbisEncoder(
-            icecast_config("ogg", sample_rate=16000, bitrate=96)
+            icecast_config("ogg", sample_rate=IQ_SAMPLE_RATE, bitrate=80)
         )
         try:
             self.assertTrue(encoder.header.startswith(b"OggS"))

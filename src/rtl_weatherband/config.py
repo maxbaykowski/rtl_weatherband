@@ -15,7 +15,7 @@ from .fallback_audio import load_fallback_audio
 
 NOAA_MIN_MHZ = 162.4
 NOAA_MAX_MHZ = 162.55
-IQ_SAMPLE_RATE = 16000
+IQ_SAMPLE_RATE = 24000
 VALID_OUTPUT_SAMPLE_RATES = (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000)
 MP3_BITRATE_LIMITS_BY_SAMPLE_RATE = {
     8000: (8, 64),
@@ -614,7 +614,7 @@ def validate_volume_config(config: VolumeConfig) -> None:
 def validate_filter_config(name: str, config: FilterConfig) -> None:
     if not config.enabled:
         return
-    if not _finite(config.frequency) or not 0 < config.frequency < AUDIO_NYQUIST_HZ:
+    if not _finite(config.frequency) or not 0 < config.frequency <= AUDIO_NYQUIST_HZ:
         raise ConfigError(f"{name}.frequency must be between 0 and {AUDIO_NYQUIST_HZ}")
     if not _finite(config.sharpness) or not 0 <= config.sharpness <= 10:
         raise ConfigError(f"{name}.sharpness must be between 0 and 10")

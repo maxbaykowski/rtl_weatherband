@@ -142,11 +142,10 @@ def _load_same_test_message_audio(sample_rate: int) -> np.ndarray:
                 raise EasRecordingError(
                     "packaged SAME test audio must be mono PCM S16_LE WAV"
                 )
-            if rate != sample_rate:
-                raise EasRecordingError(
-                    "packaged SAME test audio sample rate does not match pipeline rate"
-                )
             pcm = wav.readframes(frame_count)
+    if rate != sample_rate:
+        resampler = PcmResampler(rate, sample_rate)
+        pcm = resampler.process(pcm) + resampler.flush()
     samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
     return samples.astype(np.float32, copy=False)
 

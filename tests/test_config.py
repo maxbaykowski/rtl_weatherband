@@ -519,6 +519,37 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "1400.0-1600.0"):
             parse_config(raw)
 
+    def test_accepts_lowpass_and_notch_at_24khz_nyquist(self) -> None:
+        lowpass_raw = valid_config()
+        lowpass_raw["audio"]["lowpass"] = {
+            "enabled": True,
+            "frequency": 12000,
+            "sharpness": 5,
+        }
+        notch_raw = valid_config()
+        notch_raw["audio"]["notch"] = {
+            "enabled": True,
+            "frequency": 12000,
+            "sharpness": 5,
+        }
+
+        lowpass_config = parse_config(lowpass_raw)
+        notch_config = parse_config(notch_raw)
+
+        self.assertEqual(lowpass_config.audio.lowpass.frequency, 12000)
+        self.assertEqual(notch_config.audio.notch.frequency, 12000)
+
+    def test_rejects_filter_above_24khz_nyquist(self) -> None:
+        raw = valid_config()
+        raw["audio"]["lowpass"] = {
+            "enabled": True,
+            "frequency": 12001,
+            "sharpness": 5,
+        }
+
+        with self.assertRaisesRegex(ConfigError, "12000"):
+            parse_config(raw)
+
     def test_rejects_notch_below_enabled_highpass(self) -> None:
         raw = valid_config()
         raw["audio"]["highpass"] = {

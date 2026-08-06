@@ -5,7 +5,7 @@ import socket
 import unittest
 from unittest.mock import patch
 
-from rtl_weatherband.config import CsdrServerConfig
+from rtl_weatherband.config import IQ_SAMPLE_RATE, CsdrServerConfig
 from rtl_weatherband.csdr_server import CsdrServerError, IqStream, open_iq_stream
 
 
@@ -109,6 +109,7 @@ class IqStreamTests(unittest.TestCase):
         request = json.loads(control_socket.sent.decode("utf-8"))
         token = stream_socket.sent.decode("utf-8").strip()
         self.assertEqual(request["stream_token"], token)
+        self.assertEqual(request["sample_rate"], IQ_SAMPLE_RATE)
         self.assertEqual(request["format"], "s16")
         self.assertEqual(stream.iq_format, "s16")
 

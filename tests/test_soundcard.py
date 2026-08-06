@@ -5,8 +5,8 @@ import types
 import unittest
 from unittest.mock import patch
 
-from rtl_weatherband.config import SoundcardConfig
-from rtl_weatherband.pipeline import PCM_FRAME_BYTES, SILENCE_FRAME
+from rtl_weatherband.config import IQ_SAMPLE_RATE, SoundcardConfig
+from rtl_weatherband.pipeline import PCM_FRAME_BYTES, SILENCE_FRAME, SILENCE_FRAME_SAMPLES
 from rtl_weatherband.soundcard import (
     SoundcardDependencyError,
     SoundcardError,
@@ -55,7 +55,7 @@ class FakeSounddevice(types.SimpleNamespace):
                 "name": "default",
                 "hostapi": 0,
                 "max_output_channels": 2,
-                "default_samplerate": 16000,
+                "default_samplerate": IQ_SAMPLE_RATE,
             }
         ]
         self.hostapis = hostapis or [{"name": "ALSA"}]
@@ -110,7 +110,7 @@ class SoundcardTests(unittest.TestCase):
         stream = fake_sd.streams[0]
         outdata = bytearray(PCM_FRAME_BYTES * 5 * 2)
 
-        stream.callback(outdata, 1600, None, None)
+        stream.callback(outdata, SILENCE_FRAME_SAMPLES * 5, None, None)
 
         self.assertEqual(bytes(outdata), stereo_pcm(SILENCE_FRAME * 5))
         self.assertEqual(stream.kwargs["channels"], 2)
@@ -123,7 +123,7 @@ class SoundcardTests(unittest.TestCase):
         stream = fake_sd.streams[0]
         outdata = bytearray(PCM_FRAME_BYTES * 2)
 
-        stream.callback(outdata, 320, None, None)
+        stream.callback(outdata, SILENCE_FRAME_SAMPLES, None, None)
 
         self.assertEqual(bytes(outdata), stereo_pcm(SILENCE_FRAME))
 
@@ -135,7 +135,7 @@ class SoundcardTests(unittest.TestCase):
                     "name": "mono",
                     "hostapi": 0,
                     "max_output_channels": 1,
-                    "default_samplerate": 16000,
+                    "default_samplerate": IQ_SAMPLE_RATE,
                 }
             ],
         )
@@ -145,7 +145,7 @@ class SoundcardTests(unittest.TestCase):
         stream = fake_sd.streams[0]
         outdata = bytearray(PCM_FRAME_BYTES)
 
-        stream.callback(outdata, 320, None, None)
+        stream.callback(outdata, SILENCE_FRAME_SAMPLES, None, None)
 
         self.assertEqual(bytes(outdata), SILENCE_FRAME)
         self.assertEqual(stream.kwargs["channels"], 1)
@@ -170,7 +170,7 @@ class SoundcardTests(unittest.TestCase):
                     "name": "USB Audio: Audio (hw:1,0)",
                     "hostapi": 0,
                     "max_output_channels": 2,
-                    "default_samplerate": 16000,
+                    "default_samplerate": IQ_SAMPLE_RATE,
                 }
             ],
             hostapis=[{"name": "ALSA"}],
@@ -184,7 +184,7 @@ class SoundcardTests(unittest.TestCase):
         stream = fake_sd.streams[0]
         self.assertEqual(output.device, 3)
         self.assertEqual(stream.kwargs["device"], 3)
-        self.assertEqual(output.sample_rate, 16000)
+        self.assertEqual(output.sample_rate, IQ_SAMPLE_RATE)
 
     def test_alsa_plughw_card_only_defaults_to_pcm_device_zero(self) -> None:
         fake_sd = FakeSounddevice(
@@ -194,7 +194,7 @@ class SoundcardTests(unittest.TestCase):
                     "name": "USB Audio: Audio (hw:1,0)",
                     "hostapi": 0,
                     "max_output_channels": 2,
-                    "default_samplerate": 16000,
+                    "default_samplerate": IQ_SAMPLE_RATE,
                 }
             ],
             hostapis=[{"name": "ALSA"}],
@@ -215,7 +215,7 @@ class SoundcardTests(unittest.TestCase):
                     "name": "Tiger Lake-LP Smart Sound Technology Audio Controller Speaker",
                     "hostapi": 0,
                     "max_output_channels": 2,
-                    "default_samplerate": 16000,
+                    "default_samplerate": IQ_SAMPLE_RATE,
                 }
             ],
             hostapis=[{"name": "ALSA"}],
@@ -254,7 +254,7 @@ class SoundcardTests(unittest.TestCase):
                     "name": "Tiger Lake-LP Smart Sound Technology Audio Controller Speaker",
                     "hostapi": 0,
                     "max_output_channels": 2,
-                    "default_samplerate": 16000,
+                    "default_samplerate": IQ_SAMPLE_RATE,
                 }
             ],
             hostapis=[{"name": "ALSA"}],
@@ -291,7 +291,7 @@ class SoundcardTests(unittest.TestCase):
                     "name": "Tiger Lake-LP Smart Sound Technology Audio Controller Speaker",
                     "hostapi": 0,
                     "max_output_channels": 2,
-                    "default_samplerate": 16000,
+                    "default_samplerate": IQ_SAMPLE_RATE,
                 }
             ],
             hostapis=[{"name": "ALSA"}],
@@ -325,7 +325,7 @@ class SoundcardTests(unittest.TestCase):
                     "name": "pipewire",
                     "hostapi": 0,
                     "max_output_channels": 2,
-                    "default_samplerate": 16000,
+                    "default_samplerate": IQ_SAMPLE_RATE,
                 }
             ],
             hostapis=[{"name": "ALSA"}],
@@ -356,7 +356,7 @@ class SoundcardTests(unittest.TestCase):
                     "name": "pipewire",
                     "hostapi": 0,
                     "max_output_channels": 2,
-                    "default_samplerate": 16000,
+                    "default_samplerate": IQ_SAMPLE_RATE,
                 }
             ],
             hostapis=[{"name": "ALSA"}],
@@ -377,7 +377,7 @@ class SoundcardTests(unittest.TestCase):
                     "name": "pipewire",
                     "hostapi": 0,
                     "max_output_channels": 2,
-                    "default_samplerate": 16000,
+                    "default_samplerate": IQ_SAMPLE_RATE,
                 }
             ],
             hostapis=[{"name": "ALSA"}],

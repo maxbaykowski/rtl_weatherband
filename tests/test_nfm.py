@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from rtl_weatherband.nfm import NfmDemodulator, float_to_s16
+from rtl_weatherband.nfm import NFM_DEVIATION_GAIN, NfmDemodulator, float_to_s16
 
 
 class NfmTests(unittest.TestCase):
@@ -19,7 +19,12 @@ class NfmTests(unittest.TestCase):
         demodulated = NfmDemodulator().process(interleaved.tobytes())
 
         self.assertEqual(len(demodulated), len(iq) - 1)
-        np.testing.assert_allclose(demodulated, 0.25, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(
+            demodulated,
+            0.25 * NFM_DEVIATION_GAIN,
+            rtol=1e-6,
+            atol=1e-6,
+        )
 
     def test_demodulator_handles_split_iq_frames(self) -> None:
         iq = np.array([1 + 0j, 0 + 1j, -1 + 0j], dtype=np.complex64)
@@ -33,7 +38,12 @@ class NfmTests(unittest.TestCase):
         second = demodulator.process(payload[5:])
 
         self.assertEqual(len(first), 0)
-        np.testing.assert_allclose(second, [0.5, 0.5], rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(
+            second,
+            [0.5 * NFM_DEVIATION_GAIN, 0.5 * NFM_DEVIATION_GAIN],
+            rtol=1e-6,
+            atol=1e-6,
+        )
 
     def test_demodulates_s16_iq(self) -> None:
         iq = np.array([1 + 0j, 0 + 1j, -1 + 0j], dtype=np.complex64)
@@ -43,7 +53,12 @@ class NfmTests(unittest.TestCase):
 
         demodulated = NfmDemodulator("s16").process(interleaved.tobytes())
 
-        np.testing.assert_allclose(demodulated, [0.5, 0.5], rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(
+            demodulated,
+            [0.5 * NFM_DEVIATION_GAIN, 0.5 * NFM_DEVIATION_GAIN],
+            rtol=1e-6,
+            atol=1e-6,
+        )
 
     def test_float_to_s16_clips_output(self) -> None:
         pcm = np.frombuffer(
